@@ -1,0 +1,146 @@
+{
+  "name": "@classytic/sqlitekit",
+  "version": "0.1.0",
+  "description": "SQLite repository kit built on @classytic/repo-core — works with better-sqlite3 (Node) and expo-sqlite (React Native) via a pluggable driver interface.",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    "./repository": {
+      "types": "./dist/repository/index.d.mts",
+      "default": "./dist/repository/index.mjs"
+    },
+    "./driver": {
+      "types": "./dist/driver/index.d.mts",
+      "default": "./dist/driver/index.mjs"
+    },
+    "./driver/better-sqlite3": {
+      "types": "./dist/driver/better-sqlite3.d.mts",
+      "default": "./dist/driver/better-sqlite3.mjs"
+    },
+    "./driver/d1": {
+      "types": "./dist/driver/d1.d.mts",
+      "default": "./dist/driver/d1.mjs"
+    },
+    "./driver/pragmas": {
+      "types": "./dist/driver/pragmas.d.mts",
+      "default": "./dist/driver/pragmas.mjs"
+    },
+    "./schema": {
+      "types": "./dist/schema/index.d.mts",
+      "default": "./dist/schema/index.mjs"
+    },
+    "./batch": {
+      "types": "./dist/batch/index.d.mts",
+      "default": "./dist/batch/index.mjs"
+    },
+    "./filter": {
+      "types": "./dist/filter/index.d.mts",
+      "default": "./dist/filter/index.mjs"
+    },
+    "./actions": {
+      "types": "./dist/actions/index.d.mts",
+      "default": "./dist/actions/index.mjs"
+    },
+    "./migrate": {
+      "types": "./dist/migrate/index.d.mts",
+      "default": "./dist/migrate/index.mjs"
+    },
+    "./plugins/timestamp": {
+      "types": "./dist/plugins/timestamp/index.d.mts",
+      "default": "./dist/plugins/timestamp/index.mjs"
+    },
+    "./plugins/soft-delete": {
+      "types": "./dist/plugins/soft-delete/index.d.mts",
+      "default": "./dist/plugins/soft-delete/index.mjs"
+    },
+    "./plugins/multi-tenant": {
+      "types": "./dist/plugins/multi-tenant/index.d.mts",
+      "default": "./dist/plugins/multi-tenant/index.mjs"
+    },
+    "./plugins/audit": {
+      "types": "./dist/plugins/audit/index.d.mts",
+      "default": "./dist/plugins/audit/index.mjs"
+    },
+    "./plugins/cache": {
+      "types": "./dist/plugins/cache/index.d.mts",
+      "default": "./dist/plugins/cache/index.mjs"
+    },
+    "./plugins/ttl": {
+      "types": "./dist/plugins/ttl/index.d.mts",
+      "default": "./dist/plugins/ttl/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "sqlite",
+    "better-sqlite3",
+    "expo-sqlite",
+    "repository",
+    "repository-pattern",
+    "react-native",
+    "expo",
+    "mobile",
+    "offline-first",
+    "typescript",
+    "esm"
+  ],
+  "author": "Classytic <classytic.dev@gmail.com> (https://github.com/classytic)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/classytic/sqlitekit.git"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "test": "vitest run --project unit --project integration",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:e2e": "vitest run --project e2e",
+    "test:all": "vitest run",
+    "test:watch": "vitest --project unit --project integration",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "lint": "biome check src tests",
+    "lint:fix": "biome check src tests --write",
+    "check": "biome ci src tests --diagnostic-level=error",
+    "prepublishOnly": "npm run check && npm run build && npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@classytic/repo-core": "^0.1.0",
+    "better-sqlite3": ">=11.0.0",
+    "drizzle-orm": ">=0.30.0"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    },
+    "drizzle-orm": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@classytic/repo-core": "file:../repo-core"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.12",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^4.1.4",
+    "better-sqlite3": "^11.0.0",
+    "drizzle-kit": "^0.31.10",
+    "drizzle-orm": "^0.45.2",
+    "tsdown": "^0.21.8",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.4"
+  }
+}
