@@ -1,6 +1,150 @@
 # Changelog
 
-## [Unreleased] — initial 0.1.0
+All notable changes to this project will be documented in this file.
+
+Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.0] - 2026-04-20 — initial release
+
+### Added — `repo.explain(filter)` — query planner introspection
+
+Surfaces SQLite's `EXPLAIN QUERY PLAN` output for any filter the repository would compile. Use in dev / tests to verify an index gets hit before shipping a query path:
+
+```ts
+const plan = await users.explain(eq('email', 'a@b.com'));
+// → [{ id, parent, detail: 'SEARCH users USING INDEX users_email_unique (email=?)' }]
+```
+
+Read `detail` for `SEARCH ... USING INDEX <name>` (good) vs `SCAN <table>` (full scan — investigate). Engine-level — works on every Drizzle SQLite driver (better-sqlite3 / libsql / expo / bun-sqlite / D1). Implementation in [`src/actions/explain.ts`](src/actions/explain.ts).
+
+### Added — Online backup API (`createBackup`)
+
+Wraps better-sqlite3's online backup primitive so consumers can wire snapshots into cron / health checks / pre-deploy hooks without learning the upstream API:
+
+```ts
+import { createBackup } from '@classytic/sqlitekit/driver/backup';
+const result = await createBackup(db, '/backups/app-2026-04-20.db');
+// { destPath, durationMs, pagesCopied }
+```
+
+Safe under concurrent writes (SQLite coordinates internally). better-sqlite3-only; throws a clear error pointing at the driver-specific alternative for libsql (Turso replication), expo (filesystem copy), and D1 (`wrangler d1 backup`). New subpath `@classytic/sqlitekit/driver/backup`.
+
+### Added — VACUUM plugin (`vacuumPlugin`)
+
+Defragmentation for tables that see steady delete traffic (TTL-pruned sessions, soft-delete cleanup, idempotency windows). Three opt-in modes:
+
+| Mode | Use when | Cost |
+|---|---|---|
+| `'manual'` (default) | You already have a maintenance scheduler | Plugin only registers methods |
+| `'scheduled'` | Off-hours window with low traffic | Full `VACUUM` rewrites the file; exclusive lock |
+| `'auto-incremental'` | Production write-heavy workloads | `PRAGMA incremental_vacuum(N)` per tick — gentle, brief writer lock per page batch |
+
+Installs `repo.vacuum()`, `repo.incrementalVacuum(pages)`, `repo.stopVacuum()` plus an `onEvent` callback for observability. New subpath `@classytic/sqlitekit/plugins/vacuum`.
+
+### Added — Prepared statements helper (`repo.prepared`)
+
+Opt-in hot-path optimization. Skips SQL parse + planner step on every call after the first (5–15% latency on tight read loops). Drizzle's `.prepare()` exposed through a Repository-scoped wrapper:
+
+```ts
+const getActive = repo.prepared('getActiveByEmail', (db, table) =>
+  db.select().from(table).where(
+    and(eq(table.email, sql.placeholder('email')), eq(table.active, true)),
+  ).limit(1),
+);
+const [user] = await getActive.execute({ email: 'a@b.com' });
+```
+
+Caveats documented in JSDoc: prepared SQL is fixed, so plugin-injected predicates (multi-tenant scope, soft-delete filter) DON'T ride along — opt-in is for queries you've verified don't depend on plugin scope. Implementation in [`src/actions/prepared.ts`](src/actions/prepared.ts).
+
+### Added — FTS5 full-text search plugin (`ftsPlugin`)
+
+Native SQLite FTS5 module wired into the repository contract. Creates a vec0… err, FTS5 virtual table mirroring text columns from your source table, kept in sync via three AFTER triggers (`AI` / `AU` / `AD`). Installs `repo.search(query, options)` returning rows in BM25 ranking order:
+
+```ts
+const docs = new SqliteRepository<DocRow>({
+  db, table: docsTable,
+  plugins: [ftsPlugin({ columns: ['title', 'body'], autoCreate: true })],
+});
+await docs.create({ id: 1, title: 'Cats', body: 'meow meow' });
+const hits = await docs.search('meow*');  // BM25-ranked
+```
+
+Full FTS5 grammar passes through verbatim — phrase queries (`"exact phrase"`), prefix (`cat*`), boolean (`AND` / `OR` / `NOT`), column filters (`title:cat`). Configurable tokenizer (`unicode61` / `porter` / `trigram`) + prefix indexing. DDL helpers (`createFtsSql` / `dropFtsSql` / `rebuildFtsSql`) ship for migration-pipeline use. Module in [`src/plugins/fts/`](src/plugins/fts/) (3 files: `ddl.ts` / `index.ts` + tests). Subpath `@classytic/sqlitekit/plugins/fts`.
+
+### Added — Vector search plugin (`vectorPlugin` + `loadVectorExtension`)
+
+ANN similarity search via sqlite-vec's `vec0` virtual table. Pattern: keep domain rows in their normal table, store fixed-dimension embeddings in a sibling `<source>_vec` virtual table keyed by source rowid, query via `MATCH ?` + `k = N`. Installs three repository methods:
+
+```ts
+import Database from 'better-sqlite3';
+import { loadVectorExtension, vectorPlugin } from '@classytic/sqlitekit/plugins/vector';
+
+const raw = new Database('app.db');
+await loadVectorExtension(raw);  // load sqlite-vec into the driver
+const db = drizzle(raw);
+
+const docs = new SqliteRepository<DocRow>({
+  db, table: docsTable,
+  plugins: [vectorPlugin({ dimensions: 1536, autoCreate: true })],
+});
+
+await docs.upsertEmbedding(42, [0.1, 0.2, /* ...1536 floats */]);
+const hits = await docs.similaritySearch([0.1, 0.2, ...], { k: 5 });
+// → [{ rowid, distance, doc: { ...sourceRow } }, ...] sorted by distance asc
+```
+
+Configurable distance metric at table-creation time (`cosine` / `l2` / `l1` / `hamming`). Embeddings are written explicitly (not via triggers — embeddings come from external services, not column transforms). Joins back to the source table so callers get the full domain row + distance. better-sqlite3 only; libsql / expo / D1 use their own vector primitives. `sqlite-vec` is an optional peer dep; the loader throws a clear install hint if missing. Module in [`src/plugins/vector/`](src/plugins/vector/) (3 files: `ddl.ts` / `load.ts` / `index.ts`). Subpath `@classytic/sqlitekit/plugins/vector`.
+
+### Added — Portable lookup IR (`SqliteRepository.lookupPopulate`)
+
+`LEFT JOIN`-backed cross-table reads compatible with mongokit's `lookupPopulate`. Translates the portable `LookupSpec[]` IR (from `@classytic/repo-core/repository`) to Drizzle joins with `json_object()` / `json_group_array()` projections. Output rows match mongokit byte-for-byte: each row carries the base doc plus one key per `LookupSpec.as` (defaults to `from`), array for `single: false` and object-or-null for `single: true`.
+
+```ts
+const result = await users.lookupPopulate({
+  filters: { active: true },
+  lookups: [
+    { from: 'departments', localField: 'deptId', foreignField: 'id', as: 'department', single: true, select: ['name'] },
+    { from: 'tasks',       localField: 'id',     foreignField: 'userId', as: 'tasks', where: eq('status', 'open') },
+  ],
+  sort: { createdAt: -1 },
+  page: 1,
+  limit: 20,
+});
+// result: { method: 'offset', docs: [{ id, name, ..., department: {name}|null, tasks: [{...}, ...] }, ...], page, limit, total, pages, hasNext, hasPrev }
+```
+
+Same envelope as `getAll` — UI code paginates joined results with the same `docs / page / total / pages / hasNext / hasPrev` it uses for plain reads.
+
+**Construction:** pass a `schema` registry so the kit can resolve foreign-table names from `LookupSpec.from`:
+
+```ts
+import * as schema from './db/schema.js';
+const users = new SqliteRepository({ db, table: schema.users, schema });
+```
+
+When you constructed `db = drizzle(sqlite, { schema })` upstream, sqlitekit auto-discovers the registry — `schema` on the repo becomes optional.
+
+**Module layout** (mirrors `src/actions/aggregate/`):
+
+- `src/actions/lookup/normalize.ts` — input validation + select normalization
+- `src/actions/lookup/schema-registry.ts` — `LookupSpec.from` → Drizzle table resolver
+- `src/actions/lookup/sql-builder.ts` — JOIN + json_object SELECT assembly with Drizzle `alias()`
+- `src/actions/lookup/hydrate.ts` — JSON-string → nested object hydration
+- `src/actions/lookup/execute.ts` — orchestrator (data + count + envelope)
+- `src/actions/lookup/count.ts` — `COUNT(DISTINCT base.pk)` for accurate totals under array-shaped joins
+- `src/actions/lookup/errors.ts` — shared error builders
+
+**Scope** — single-level joins via `localField` ↔ `foreignField` equality. Each lookup may filter the foreign side via `where` (compiles through the same Filter IR compiler as base-side filters). Out of scope by design — reach for raw Drizzle when you need:
+
+- nested lookups (lookup-on-a-lookup)
+- sort by a joined-row field
+- cross-database joins
+- JOIN kinds beyond LEFT (INNER, CROSS, FULL OUTER)
+
+**Tests** — 21 lookup integration scenarios across one-to-one, one-to-many, multi-lookup composition, foreign-side `where` filter, base-side filter / sort / select, pagination (offset envelope + `countStrategy: 'none'`), and validation errors. Total sqlitekit suite: **271 tests** (was 250).
+
+**Performance notes** — `json_object` / `json_group_array` are C-implemented in SQLite 3.38+ (ships with better-sqlite3 12+, libsql, expo-sqlite, D1). Cost is proportional to joined row count, only marginally above a plain LEFT JOIN. One-to-many lookups force `GROUP BY base.pk` automatically; one-to-one joins skip the grouping for query-plan efficiency.
 
 ### Architecture
 

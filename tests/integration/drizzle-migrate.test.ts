@@ -25,18 +25,28 @@ describe('fromDrizzleDir + createMigrator — fixture migrations', () => {
     try {
       const driver = createBetterSqlite3Driver(db);
       const migrations = await fromDrizzleDir({ dir: fixtureMigrationsDir });
-      expect(migrations.map((m) => m.name)).toEqual(['0000_init']);
+      expect(migrations.map((m) => m.name)).toEqual(['0000_init', '0001_lookup_tables']);
 
       const migrator = createMigrator({ driver, migrations });
       const applied = await migrator.up();
-      expect(applied).toEqual(['0000_init']);
+      expect(applied).toEqual(['0000_init', '0001_lookup_tables']);
 
       const tables = db
         .prepare(
           "SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('_sqlitekit_migrations') ORDER BY name",
         )
         .all() as { name: string }[];
-      expect(tables.map((t) => t.name)).toEqual(['sessions', 'tasks', 'users']);
+      expect(tables.map((t) => t.name)).toEqual([
+        'conformance',
+        'departments',
+        'employee_tasks',
+        'employees',
+        'posts',
+        'sessions',
+        'sqlite_sequence',
+        'tasks',
+        'users',
+      ]);
 
       // Re-running `up()` is a no-op — the tracking row prevents re-application.
       const second = await migrator.up();
@@ -54,12 +64,15 @@ describe('fromDrizzleDir + createMigrator — fixture migrations', () => {
       const migrator = createMigrator({ driver, migrations });
 
       const before = await migrator.status();
-      expect(before).toEqual([{ name: '0000_init', applied: false }]);
+      expect(before).toEqual([
+        { name: '0000_init', applied: false },
+        { name: '0001_lookup_tables', applied: false },
+      ]);
 
       await migrator.up();
       const after = await migrator.status();
-      expect(after).toHaveLength(1);
-      expect(after[0]?.applied).toBe(true);
+      expect(after).toHaveLength(2);
+      expect(after.every((r) => r.applied)).toBe(true);
       expect(after[0]?.appliedAt).toBeTypeOf('string');
     } finally {
       db.close();
@@ -104,9 +117,19 @@ describe('fromDrizzleDir + createMigrator — fixture migrations', () => {
         join(downDir, '0000_init.sql'),
         'DROP TABLE IF EXISTS `tasks`;\n--> statement-breakpoint\nDROP TABLE IF EXISTS `users`;\n',
       );
+      // The fixture grew a second migration (`0001_lookup_tables`) after
+      // the first version of this test landed. Migrator.down rolls back
+      // newest-first and refuses to start without a script for every
+      // applied migration, so we ship a matching down for the second
+      // one too.
+      await writeFile(
+        join(downDir, '0001_lookup_tables.sql'),
+        'DROP TABLE IF EXISTS `employee_tasks`;\n--> statement-breakpoint\nDROP TABLE IF EXISTS `employees`;\n--> statement-breakpoint\nDROP TABLE IF EXISTS `departments`;\n',
+      );
 
       const migrations = await fromDrizzleDir({ dir: upDir, down: downDir });
       expect(migrations[0]?.down).toBeDefined();
+      expect(migrations[1]?.down).toBeDefined();
 
       const db = new Database(':memory:');
       try {
@@ -115,15 +138,15 @@ describe('fromDrizzleDir + createMigrator — fixture migrations', () => {
         await migrator.up();
         const before = db
           .prepare(
-            "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('users','tasks')",
+            "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('users','tasks','employees','departments')",
           )
           .get() as { n: number };
-        expect(before.n).toBe(2);
+        expect(before.n).toBe(4);
 
         await migrator.down(null);
         const after = db
           .prepare(
-            "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('users','tasks')",
+            "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name IN ('users','tasks','employees','departments')",
           )
           .get() as { n: number };
         expect(after.n).toBe(0);
