@@ -34,7 +34,6 @@ import {
   inArray,
   isNotNull,
   isNull,
-  like,
   lt,
   lte,
   ne,
@@ -97,13 +96,20 @@ export function compileFilterToDrizzle(filter: Filter, table: SQLiteTable): SQL 
 
     case 'like': {
       const col = column(table, filter.field);
+      // SQLite LIKE treats `%` and `_` as wildcards. Callers pass
+      // `\\%` / `\\_` (literal backslash + meta) when they want the
+      // metachars matched as literals — SQLite's `ESCAPE '\'` clause
+      // tells the engine the backslash is the escape marker. Without
+      // it `like('notes', '50\\% off')` would match every row because
+      // `%` would still wildcard.
+      //
       // SQLite LIKE is case-insensitive for ASCII by default and case-
-      // sensitive otherwise. For predictable behavior we lower() both
+      // sensitive otherwise. For predictable behavior we `lower()` both
       // sides when the caller asked for insensitive.
       if (filter.caseSensitivity === 'sensitive') {
-        return like(col, filter.pattern);
+        return sql`${col} LIKE ${filter.pattern} ESCAPE '\\'`;
       }
-      return sql`lower(${col}) LIKE lower(${filter.pattern})`;
+      return sql`lower(${col}) LIKE lower(${filter.pattern}) ESCAPE '\\'`;
     }
 
     case 'regex':

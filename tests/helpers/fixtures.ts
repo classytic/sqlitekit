@@ -25,7 +25,16 @@ import { createBetterSqlite3Driver } from '../../src/driver/better-sqlite3.js';
 import type { SqliteDriver } from '../../src/driver/types.js';
 import { createMigrator, fromDrizzleDir } from '../../src/migrate/index.js';
 import type { SqliteDb } from '../../src/repository/types.js';
-import { sessionsTable, tasksTable, usersTable } from '../fixtures/drizzle-schema.js';
+import {
+  conformanceTable,
+  departmentsTable,
+  employeesTable,
+  employeeTasksTable,
+  postsTable,
+  sessionsTable,
+  tasksTable,
+  usersTable,
+} from '../fixtures/drizzle-schema.js';
 
 export interface TestDb {
   /** Drizzle SQLite database — pass into `new SqliteRepository({ db, ... })`. */
@@ -52,7 +61,16 @@ export async function makeFixtureDb(): Promise<TestDb> {
   const migrator = createMigrator({ driver, migrations });
   await migrator.up();
   const db = drizzle(raw, {
-    schema: { users: usersTable, tasks: tasksTable, sessions: sessionsTable },
+    schema: {
+      users: usersTable,
+      tasks: tasksTable,
+      sessions: sessionsTable,
+      conformance: conformanceTable,
+      departments: departmentsTable,
+      employees: employeesTable,
+      employee_tasks: employeeTasksTable,
+      posts: postsTable,
+    },
   }) as unknown as SqliteDb;
   return {
     db,

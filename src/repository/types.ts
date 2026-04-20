@@ -25,3 +25,12 @@ import type { BaseSQLiteDatabase } from 'drizzle-orm/sqlite-core';
  */
 // biome-ignore lint/suspicious/noExplicitAny: Drizzle's generics here are kit-internal — we accept any TFullSchema/TRelations and any sync/async result kind.
 export type SqliteDb = BaseSQLiteDatabase<'sync' | 'async', any, any, any>;
+
+/**
+ * Re-export the canonical bulk-write shapes from repo-core so sqlitekit
+ * consumers importing from `@classytic/sqlitekit/repository` pick up
+ * the same types mongokit / pgkit / prismakit all implement against.
+ * The kit-specific SQL constraints (no `$set` operators, SELECT-then-
+ * UPDATE dispatch) are documented on `SqliteRepository.bulkWrite`.
+ */
+export type { BulkWriteOperation, BulkWriteResult } from '@classytic/repo-core/repository';

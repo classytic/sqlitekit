@@ -157,7 +157,7 @@ describe('increment', () => {
   });
 });
 
-describe('aggregate', () => {
+describe('aggregate (scalar — no groupBy)', () => {
   let db: TestDb;
   let repo: SqliteRepository<TestUser>;
 
@@ -173,22 +173,45 @@ describe('aggregate', () => {
 
   afterEach(() => db.close());
 
-  it('count + sum + avg in one call', async () => {
-    const result = await repo.aggregate({ count: true, sum: 'age', avg: 'age' });
-    expect(result.count).toBe(3);
-    expect(result.sum_age).toBe(100);
-    expect(Math.round(result.avg_age ?? 0)).toBe(33);
+  it('count + sum + avg in one call — single row result', async () => {
+    const { rows } = await repo.aggregate<{
+      count: number;
+      totalAge: number;
+      avgAge: number;
+    }>({
+      measures: {
+        count: { op: 'count' },
+        totalAge: { op: 'sum', field: 'age' },
+        avgAge: { op: 'avg', field: 'age' },
+      },
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.count).toBe(3);
+    expect(rows[0]?.totalAge).toBe(100);
+    expect(Math.round(rows[0]?.avgAge ?? 0)).toBe(33);
   });
 
-  it('filtered aggregation scopes to matching rows', async () => {
-    const result = await repo.aggregate({ count: true, filter: gt('age', 28) });
-    expect(result.count).toBe(2);
+  it('filter scopes the aggregate to matching rows', async () => {
+    const { rows } = await repo.aggregate<{ count: number }>({
+      filter: gt('age', 28),
+      measures: { count: { op: 'count' } },
+    });
+    expect(rows[0]?.count).toBe(2);
   });
 
   it('min/max track extremes', async () => {
-    const result = await repo.aggregate({ min: 'age', max: 'age' });
-    expect(result.min_age).toBe(25);
-    expect(result.max_age).toBe(45);
+    const { rows } = await repo.aggregate<{ youngest: number; oldest: number }>({
+      measures: {
+        youngest: { op: 'min', field: 'age' },
+        oldest: { op: 'max', field: 'age' },
+      },
+    });
+    expect(rows[0]?.youngest).toBe(25);
+    expect(rows[0]?.oldest).toBe(45);
+  });
+
+  it('empty measures bag is a wiring bug', async () => {
+    await expect(repo.aggregate({ measures: {} })).rejects.toThrow(/at least one measure/);
   });
 });
 

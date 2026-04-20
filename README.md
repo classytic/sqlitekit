@@ -2,7 +2,7 @@
 
 Drizzle-backed SQLite repository kit for Node, Expo / React Native, and edge runtimes (Cloudflare D1, libsql, bun:sqlite). One repository class — same code on every environment, only the driver line differs.
 
-Built on [`@classytic/repo-core`](../repo-core), it implements the `MinimalRepo<TDoc>` contract that the rest of the kit family (`mongokit`, `prismakit`, future `pgkit` / `mysqlkit`) shares — so apps can move between data stores without rewriting controllers.
+Built on [`@classytic/repo-core`](https://www.npmjs.com/package/@classytic/repo-core), it implements the `StandardRepo<TDoc>` contract shared by [`@classytic/mongokit`](https://www.npmjs.com/package/@classytic/mongokit) and future kits (`pgkit`, `prismakit`) — controller code written against the contract runs unchanged on any kit.
 
 ## Design
 
@@ -276,6 +276,15 @@ createBetterSqlite3Driver(db, { pragmas: productionPragmas() });
 ```
 
 Three presets: `productionPragmas()`, `readOnlyPragmas()`, `testPragmas()`. The single biggest perf cliff for new SQLite users — turn it on.
+
+## Escape hatches — views, triggers, custom DDL
+
+Sqlitekit is the repository / filter / plugin layer on top of Drizzle. It deliberately does not wrap SQLite DDL primitives — they're already one import away:
+
+- **Views.** SQLite supports views; Drizzle exposes [`sqliteView()`](https://orm.drizzle.team/docs/views). Define the view in your Drizzle schema and pass it as `table` to `SqliteRepository` — reads work out of the box (writes correctly fail, since views aren't writable).
+- **Triggers.** Use `driver.exec(sql)` with a raw `CREATE TRIGGER` statement, or emit one from a Drizzle migration. Sqlitekit already does this internally where it adds value (TTL `trigger` mode, soft-delete / TTL partial indexes).
+- **Stored procedures.** Not supported — SQLite itself has no stored procedures. This is a SQLite engine limitation, not a sqlitekit gap. Put the logic in application code (hooks, plugins, or `withTransaction`) instead.
+- **Anything else (CHECK constraints, FTS5 tables, virtual tables, custom functions).** Define in your Drizzle schema or run via `driver.exec()`. Sqlitekit stays out of your way.
 
 ## Status
 

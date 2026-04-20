@@ -26,3 +26,16 @@ CREATE TABLE `sessions` (
 	`userId` text NOT NULL,
 	`expiresAt` text NOT NULL
 );
+--> statement-breakpoint
+CREATE TABLE `conformance` (
+	`id` text PRIMARY KEY NOT NULL,
+	`name` text NOT NULL,
+	`email` text NOT NULL,
+	`category` text,
+	`count` integer DEFAULT 0 NOT NULL,
+	`active` integer DEFAULT true NOT NULL,
+	`notes` text,
+	`createdAt` text NOT NULL
+);
+--> statement-breakpoint
+CREATE UNIQUE INDEX `conformance_email_unique` ON `conformance` (`email`);

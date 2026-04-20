@@ -28,9 +28,17 @@
 
 import type { Filter } from '@classytic/repo-core/filter';
 import { isFilter, TRUE } from '@classytic/repo-core/filter';
+import type { OffsetPaginationResult } from '@classytic/repo-core/pagination';
 import type {
+  AggPaginationRequest,
+  AggRequest,
+  AggResult,
+  BulkWriteOperation,
+  BulkWriteResult,
   DeleteOptions,
   DeleteResult,
+  LookupPopulateOptions,
+  LookupPopulateResult,
   MinimalRepo,
   PaginationParams,
   QueryOptions,
@@ -39,9 +47,12 @@ import type {
 import { RepositoryBase, type RepositoryBaseOptions } from '@classytic/repo-core/repository';
 import { asc, desc, getTableColumns, getTableName } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
-import * as aggregateActions from '../actions/aggregate.js';
+import { countAggGroups, executeAgg } from '../actions/aggregate/index.js';
 import * as createActions from '../actions/create.js';
 import * as deleteActions from '../actions/delete.js';
+import { type ExplainRow, explain as explainAction } from '../actions/explain.js';
+import { executeLookup } from '../actions/lookup/index.js';
+import { buildPrepared, type PreparedBuilder, type PreparedHandle } from '../actions/prepared.js';
 import * as readActions from '../actions/read.js';
 import * as updateActions from '../actions/update.js';
 import { type BatchItem, type RepoBatchBuilder, withBatch } from '../batch/batch.js';
@@ -65,6 +76,18 @@ export interface SqliteRepositoryOptions extends Omit<RepositoryBaseOptions, 'na
   idField?: string;
   /** Override `RepositoryBase.modelName`. Defaults to the table name. */
   name?: string;
+  /**
+   * Map of `tableName → SQLiteTable` used by `lookupPopulate` to
+   * resolve the foreign tables named in `LookupSpec.from`. Typically
+   * the same Drizzle schema module the app already exports, e.g.
+   * `import * as schema from './db/schema.js'; new SqliteRepository({ db, table: schema.users, schema });`.
+   *
+   * If you constructed your db with `drizzle(sqlite, { schema })`,
+   * sqlitekit can read that schema directly — passing `schema` here
+   * is then optional. Without either source, lookups throw a clear
+   * "table not found" error pointing at the fix.
+   */
+  schema?: Record<string, SQLiteTable>;
 }
 
 /** Read-operation extensions on top of repo-core's `QueryOptions`. */
@@ -90,9 +113,16 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
   readonly idColumn: SQLiteColumn;
   readonly columns: Readonly<Record<string, SQLiteColumn>>;
   readonly pagination: PaginationEngine;
+  /**
+   * Foreign-table registry used by `lookupPopulate`. `undefined` when
+   * the caller didn't pass `schema` AND the underlying db wasn't
+   * constructed with one — lookups still work for tables Drizzle can
+   * resolve via the db, but throw a clear error otherwise.
+   */
+  readonly schema: Record<string, SQLiteTable> | undefined;
 
   constructor(options: SqliteRepositoryOptions) {
-    const { plugins, hooks, pluginOrderChecks, name, table, db, idField } = options;
+    const { plugins, hooks, pluginOrderChecks, name, table, db, idField, schema } = options;
     if (!table) {
       throw new Error('sqlitekit: SqliteRepository requires a Drizzle `table`');
     }
@@ -112,6 +142,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     });
     this.db = db;
     this.table = table;
+    this.schema = schema;
 
     const columns = getTableColumns(table) as Record<string, SQLiteColumn>;
     this.columns = columns;
@@ -482,23 +513,181 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     return updateActions.increment<TDoc>(this.db, this.table, this.idColumn, id, col, delta);
   }
 
-  async aggregate(options: {
-    filter?: Record<string, unknown> | Filter;
-    count?: boolean;
-    sum?: string;
-    avg?: string;
-    min?: string;
-    max?: string;
-  }): Promise<Record<string, number>> {
-    const f = this.#asFilter(options.filter);
-    const where = compileFilterToDrizzle(f, this.table);
-    const request: aggregateActions.AggregateRequest = {};
-    if (options.count) request.count = true;
-    if (options.sum) request.sum = this.#col(options.sum);
-    if (options.avg) request.avg = this.#col(options.avg);
-    if (options.min) request.min = this.#col(options.min);
-    if (options.max) request.max = this.#col(options.max);
-    return aggregateActions.aggregate(this.db, this.table, where, request);
+  /**
+   * Portable aggregation. Compiles the repo-core `AggRequest` IR to
+   * `SELECT ... WHERE ... GROUP BY ... HAVING ... ORDER BY ... LIMIT
+   * ... OFFSET` against this repo's Drizzle table. Output rows carry
+   * one key per `groupBy` column plus one key per measure alias — the
+   * same shape mongokit's `aggregate(req)` returns, so dashboards and
+   * admin tooling work unchanged across backends.
+   *
+   * Without `groupBy`: returns a single-row result with just the
+   * measures (scalar aggregation). Pass
+   * `{ measures: { total: { op: 'sum', field: 'amount' } } }` for a
+   * simple summary.
+   *
+   * Kit-native escapes for anything the IR doesn't express (window
+   * functions, CTEs, lateral joins, `$lookup`, `$unwind`) live on
+   * `repo.db` — Drizzle owns those directly.
+   */
+  async aggregate<TRow extends Record<string, unknown> = Record<string, unknown>>(
+    req: AggRequest,
+  ): Promise<AggResult<TRow>> {
+    const context = await this._buildContext('aggregate', { aggRequest: req });
+    try {
+      const rows = await executeAgg<TRow>(this.db, this.table, this.#normalizeAggReq(req));
+      const result: AggResult<TRow> = { rows };
+      await this._emitAfter('aggregate', context, result);
+      return result;
+    } catch (err) {
+      await this._emitError('aggregate', context, err as Error);
+      throw err;
+    }
+  }
+
+  /**
+   * Offset-paginated aggregation. Same IR as `aggregate`, wrapped in
+   * the standard `OffsetPaginationResult` envelope so UI code
+   * paginates aggregated dashboards with the same primitives as raw
+   * document lists.
+   *
+   * `countStrategy: 'none'` skips the second round-trip that computes
+   * `total`; the envelope reports `total: 0`, `pages: 0`, and derives
+   * `hasNext` from a `LIMIT N+1` peek on the data query.
+   */
+  async aggregatePaginate<TRow extends Record<string, unknown> = Record<string, unknown>>(
+    req: AggPaginationRequest,
+  ): Promise<OffsetPaginationResult<TRow>> {
+    const context = await this._buildContext('aggregatePaginate', { aggRequest: req });
+    const page = Math.max(1, req.page ?? 1);
+    const limit = Math.max(1, Math.min(req.limit ?? 20, 1000));
+    const countStrategy = req.countStrategy ?? 'exact';
+    const offset = (page - 1) * limit;
+
+    try {
+      const normalized = this.#normalizeAggReq(req);
+      if (countStrategy === 'none') {
+        // Peek one extra row to detect hasNext without running COUNT.
+        const peek = await executeAgg<TRow>(this.db, this.table, {
+          ...normalized,
+          limit: limit + 1,
+          offset,
+        });
+        const hasNext = peek.length > limit;
+        const docs = hasNext ? peek.slice(0, limit) : peek;
+        const result: OffsetPaginationResult<TRow> = {
+          method: 'offset',
+          docs,
+          page,
+          limit,
+          total: 0,
+          pages: 0,
+          hasNext,
+          hasPrev: page > 1,
+        };
+        await this._emitAfter('aggregatePaginate', context, result);
+        return result;
+      }
+
+      // Run data + count in parallel — SQLite in-memory + WAL-file both
+      // handle concurrent reads on the same connection fine.
+      const [docs, total] = await Promise.all([
+        executeAgg<TRow>(this.db, this.table, { ...normalized, limit, offset }),
+        countAggGroups(this.db, this.table, normalized),
+      ]);
+      const pages = Math.max(1, Math.ceil(total / limit));
+      const result: OffsetPaginationResult<TRow> = {
+        method: 'offset',
+        docs,
+        page,
+        limit,
+        total,
+        pages,
+        hasNext: page * limit < total,
+        hasPrev: page > 1,
+      };
+      await this._emitAfter('aggregatePaginate', context, result);
+      return result;
+    } catch (err) {
+      await this._emitError('aggregatePaginate', context, err as Error);
+      throw err;
+    }
+  }
+
+  /**
+   * Portable join + paginate. Compiles the repo-core `LookupSpec[]` IR
+   * into a `LEFT JOIN` query with `json_object()` / `json_group_array()`
+   * projections — same row shape mongokit's `lookupPopulate` produces,
+   * so dashboards and detail views are byte-stable across backends.
+   *
+   * Each lookup lands its joined data on `as` (defaults to `from`):
+   *
+   *   - `single: true` → object | null (one-to-one, many-to-one)
+   *   - default        → object[]      (one-to-many)
+   *
+   * Filter on the BASE table only — joined-side fields aren't sortable
+   * through this contract by design (cross-kit divergence is too high
+   * for sort on denormalized join payloads). Reach for the kit-native
+   * escape (`repo.db` raw Drizzle) when you need that.
+   *
+   * Requires the foreign tables to be reachable via the repo's `schema`
+   * registry — passed through `new SqliteRepository({ ..., schema })`
+   * or auto-discovered when the db itself was constructed with
+   * `drizzle(sqlite, { schema })`. Tables not in the registry surface
+   * a clear error pointing at the fix.
+   *
+   * @example
+   * ```ts
+   * const result = await users.lookupPopulate({
+   *   filters: { active: true },
+   *   lookups: [
+   *     { from: 'departments', localField: 'deptId', foreignField: 'id', as: 'department', single: true },
+   *     { from: 'tasks',       localField: 'id',     foreignField: 'userId', as: 'tasks', select: ['id', 'title'] },
+   *   ],
+   *   sort: { createdAt: -1 },
+   *   page: 1,
+   *   limit: 20,
+   * });
+   * // result.docs[0]: { id, name, ..., department: {...} | null, tasks: [{id, title}, ...] }
+   * // result: { method: 'offset', docs, page, limit, total, pages, hasNext, hasPrev }
+   * ```
+   */
+  async lookupPopulate<TExtra extends Record<string, unknown> = Record<string, unknown>>(
+    options: LookupPopulateOptions<TDoc>,
+  ): Promise<LookupPopulateResult<TDoc, TExtra>> {
+    const context = await this._buildContext('lookupPopulate', {
+      filters: options.filters,
+      lookups: options.lookups,
+      sort: options.sort,
+      page: options.page,
+      limit: options.limit,
+      select: options.select,
+      countStrategy: options.countStrategy,
+    });
+    try {
+      // Plugin scope (multi-tenant orgId, soft-delete tombstone) is
+      // injected via `context.filters` / `context.query`. Merge with
+      // the caller's filter so policy stays enforced under joins.
+      const callerFilter = (context.filters ?? options.filters) as
+        | Filter
+        | Record<string, unknown>
+        | undefined;
+      const policyScope = context.query as Filter | Record<string, unknown> | undefined;
+      const filter = this.#mergeFilters(callerFilter, policyScope);
+      const result = await executeLookup<TDoc, TExtra>({
+        db: this.db,
+        baseTable: this.table,
+        basePkColumns: [this.idColumn],
+        ...(this.schema !== undefined ? { schema: this.schema } : { schema: undefined }),
+        ...(filter !== undefined ? { filter } : { filter: undefined }),
+        options,
+      });
+      await this._emitAfter('lookupPopulate', context, result);
+      return result;
+    } catch (err) {
+      await this._emitError('lookupPopulate', context, err as Error);
+      throw err;
+    }
   }
 
   async distinct<T = unknown>(
@@ -508,6 +697,78 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     const f = this.#asFilter(filter);
     const where = compileFilterToDrizzle(f, this.table);
     return readActions.distinct<T>(this.db, this.table, this.#col(field), where);
+  }
+
+  /**
+   * Alias of `getOne`. Arc's BaseController + AccessControl probe both
+   * names (`getOne` and `getByQuery`) for compound-filter reads — kits
+   * that expose only one trip the slower `getById` + post-fetch fallback.
+   */
+  async getByQuery(
+    filter: Record<string, unknown> | Filter,
+    options: QueryOptions = {},
+  ): Promise<TDoc | null> {
+    return this.getOne(filter, options);
+  }
+
+  /**
+   * Atomic find-or-create. Returns the matching row, or inserts `data`
+   * and returns the new row when nothing matches. Wraps the SELECT +
+   * INSERT pair in a transaction so two concurrent callers don't both
+   * insert against a non-unique lookup key.
+   *
+   * For slug-style lookups the lookup keys typically live in `filter`
+   * and `data` carries the full document defaults — the row-on-miss
+   * path inserts `data` exactly, so include the lookup fields there too
+   * if your schema needs them.
+   */
+  async getOrCreate(
+    filter: Record<string, unknown> | Filter,
+    data: Partial<TDoc>,
+    options: WriteOptions = {},
+  ): Promise<TDoc> {
+    const context = await this._buildContext('getOrCreate', {
+      query: filter,
+      data,
+      ...options,
+    });
+    try {
+      const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
+      const where = compileFilterToDrizzle(f, this.table);
+      const payload = (context.data ?? data) as Partial<TDoc>;
+      const result = await withManualTransaction(this.db, async (tx) =>
+        readActions.getOrCreate<TDoc>(tx, this.table, where, payload),
+      );
+      await this._emitAfter('getOrCreate', context, result);
+      return result;
+    } catch (err) {
+      await this._emitError('getOrCreate', context, err as Error);
+      throw err;
+    }
+  }
+
+  /**
+   * Convenience for slug-style lookups. Defaults to a column named
+   * `"slug"` — pass an explicit field name for tables that key on
+   * `code`, `handle`, etc. Equivalent to `getOne({ [field]: slug })`
+   * and routes through the same hook pipeline (multi-tenant scope,
+   * soft-delete filter, cache).
+   *
+   * Throws when the configured field doesn't exist on the table —
+   * that's a wiring bug, not a runtime miss.
+   */
+  async getBySlug(
+    slug: string,
+    options: QueryOptions & { field?: string } = {},
+  ): Promise<TDoc | null> {
+    const field = options.field ?? 'slug';
+    if (!this.columns[field]) {
+      throw new Error(
+        `sqlitekit: getBySlug requires column "${field}" on table "${getTableName(this.table)}"`,
+      );
+    }
+    const { field: _omit, ...rest } = options;
+    return this.getOne({ [field]: slug }, rest);
   }
 
   // ────────────────────────────────────────────────────────────────────
@@ -527,6 +788,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       idField: this.idField,
       name: this.modelName,
       pluginOrderChecks: 'off',
+      ...(this.schema ? { schema: this.schema } : {}),
     });
   }
 
@@ -566,6 +828,222 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     return withBatch(this.db, (factory) => builder(factory(this)));
   }
 
+  /**
+   * Surface SQLite's `EXPLAIN QUERY PLAN` for the given filter — the
+   * same shape `sqlite3` CLI prints. Use this in dev / tests to verify
+   * an index gets hit before shipping a query path:
+   *
+   * ```ts
+   * const plan = await users.explain(eq('email', 'a@b.com'));
+   * for (const row of plan) console.log(row.detail);
+   * // → SEARCH users USING INDEX users_email_unique (email=?)
+   * ```
+   *
+   * Look for `SEARCH ... USING INDEX <name>` to confirm an index hit;
+   * `SCAN <table>` means full-table scan (which may be fine for tiny
+   * tables but is the first thing to investigate when a query is slow).
+   *
+   * Engine-level — works on every Drizzle SQLite driver
+   * (better-sqlite3, libsql, expo, bun-sqlite, D1).
+   */
+  async explain(filter: Filter | Record<string, unknown>): Promise<ExplainRow[]> {
+    return explainAction(this.db, this.table, this.#asFilter(filter));
+  }
+
+  /**
+   * Build a Drizzle prepared statement scoped to this repository's
+   * `db` + `table`. Hot-path opt-in — saves the SQL parse + planner
+   * step on every call after the first (5–15% latency on tight read
+   * loops). The trade-off: prepared SQL is fixed, so plugin-injected
+   * predicates (multi-tenant scope, soft-delete filter) DO NOT ride
+   * along. Use prepared statements only for queries you've already
+   * verified don't depend on plugin scope, or build the scope into
+   * the placeholders explicitly.
+   *
+   * `name` is required — Drizzle disambiguates plans by it. Keep
+   * names unique per repository.
+   *
+   * @example
+   * ```ts
+   * const getActive = repo.prepared('getActiveByEmail', (db, table) =>
+   *   db.select().from(table).where(
+   *     and(eq(table.email, sql.placeholder('email')), eq(table.active, true)),
+   *   ).limit(1),
+   * );
+   *
+   * // Hot path — no parse / plan after the first call.
+   * const [user] = await getActive.execute({ email: 'a@b.com' });
+   * ```
+   *
+   * @see `@classytic/sqlitekit/actions` `buildPrepared` for the
+   *   underlying primitive that doesn't require a Repository instance.
+   */
+  prepared<TParams = Record<string, unknown>, TResult = unknown>(
+    name: string,
+    builder: PreparedBuilder<unknown>,
+  ): PreparedHandle<TParams, TResult> {
+    return buildPrepared<TParams, TResult>(this.db, this.table, name, builder);
+  }
+
+  /**
+   * Heterogeneous bulk write — accepts the arc-canonical operation shape
+   * (`insertOne` / `updateOne` / `updateMany` / `deleteOne` / `deleteMany`
+   * / `replaceOne`) and dispatches each op against this repo's table
+   * inside a single transaction. Returns mongo-shaped counts so arc code
+   * written against mongokit's bulkWrite drops in unchanged.
+   *
+   * Goes through `withManualTransaction` (not `withBatch`) because the
+   * dispatch is heterogeneous and `updateOne` / `replaceOne` require a
+   * SELECT-then-UPDATE for the upsert path — that intermediate read
+   * doesn't fit the batch primitive's "list of pre-built statements"
+   * model.
+   *
+   * Plugins / hooks are bypassed for the same fast-path reason as
+   * `batch()` — use `withTransaction` + per-call CRUD when policy hooks
+   * (multi-tenant, audit, soft-delete) need to fire for each op.
+   */
+  async bulkWrite(operations: readonly BulkWriteOperation<TDoc>[]): Promise<BulkWriteResult> {
+    if (operations.length === 0) {
+      return {
+        ok: 1,
+        insertedCount: 0,
+        matchedCount: 0,
+        modifiedCount: 0,
+        deletedCount: 0,
+        upsertedCount: 0,
+        insertedIds: {},
+        upsertedIds: {},
+      };
+    }
+
+    return withManualTransaction(this.db, async (tx) => {
+      const result: Required<BulkWriteResult> = {
+        ok: 1,
+        insertedCount: 0,
+        matchedCount: 0,
+        modifiedCount: 0,
+        deletedCount: 0,
+        upsertedCount: 0,
+        insertedIds: {},
+        upsertedIds: {},
+      };
+
+      for (let i = 0; i < operations.length; i++) {
+        const op = operations[i] as BulkWriteOperation<TDoc>;
+
+        if ('insertOne' in op) {
+          const row = await createActions.create<TDoc>(
+            tx,
+            this.table,
+            op.insertOne.document as Partial<TDoc>,
+          );
+          result.insertedCount += 1;
+          result.insertedIds[i] = (row as Record<string, unknown>)[this.idField];
+          continue;
+        }
+
+        if ('deleteOne' in op || 'deleteMany' in op) {
+          const filter = 'deleteOne' in op ? op.deleteOne.filter : op.deleteMany.filter;
+          const where = compileFilterToDrizzle(this.#asFilter(filter), this.table);
+          if (where === undefined) {
+            throw new Error('sqlitekit: bulkWrite delete op requires a non-empty filter');
+          }
+          if ('deleteOne' in op) {
+            // Limit to 1 by selecting the first PK then deleting by it.
+            const rows = await tx
+              .select({ id: this.idColumn })
+              .from(this.table)
+              .where(where)
+              .limit(1);
+            const id = (rows[0] as { id: unknown } | undefined)?.id;
+            if (id !== undefined) {
+              const removed = await deleteActions.deleteById(tx, this.table, this.idColumn, id);
+              if (removed) result.deletedCount += 1;
+            }
+          } else {
+            const removed = await deleteActions.deleteMany(tx, this.table, this.idColumn, where);
+            result.deletedCount += removed;
+          }
+          continue;
+        }
+
+        if ('updateMany' in op) {
+          const where = compileFilterToDrizzle(this.#asFilter(op.updateMany.filter), this.table);
+          if (where === undefined) {
+            throw new Error('sqlitekit: bulkWrite updateMany op requires a non-empty filter');
+          }
+          const counts = await updateActions.updateMany(
+            tx,
+            this.table,
+            this.idColumn,
+            where,
+            op.updateMany.update,
+          );
+          result.matchedCount += counts.matchedCount;
+          result.modifiedCount += counts.modifiedCount;
+          continue;
+        }
+
+        if ('updateOne' in op || 'replaceOne' in op) {
+          const isReplace = 'replaceOne' in op;
+          const filter = isReplace ? op.replaceOne.filter : op.updateOne.filter;
+          const data = (
+            isReplace ? op.replaceOne.replacement : op.updateOne.update
+          ) as Partial<TDoc>;
+          const upsert = isReplace ? op.replaceOne.upsert : op.updateOne.upsert;
+          const where = compileFilterToDrizzle(this.#asFilter(filter), this.table);
+          if (where === undefined) {
+            throw new Error('sqlitekit: bulkWrite update/replace op requires a non-empty filter');
+          }
+          // SELECT the PK of the first match so we can route through
+          // updateById (which gives us a deterministic single-row update
+          // on backends without LIMIT-on-UPDATE support).
+          const rows = await tx
+            .select({ id: this.idColumn })
+            .from(this.table)
+            .where(where)
+            .limit(1);
+          const id = (rows[0] as { id: unknown } | undefined)?.id;
+          if (id !== undefined) {
+            const updated = await updateActions.updateById<TDoc>(
+              tx,
+              this.table,
+              this.idColumn,
+              id,
+              data,
+            );
+            if (updated) {
+              result.matchedCount += 1;
+              result.modifiedCount += 1;
+            }
+            continue;
+          }
+          if (upsert) {
+            // Merge filter literals (when the filter is a flat record)
+            // with the payload — same convention as findOneAndUpdate's
+            // upsert path.
+            const merged: Record<string, unknown> = {
+              ...(typeof filter === 'object' && filter !== null && !isFilter(filter) ? filter : {}),
+              ...(data as Record<string, unknown>),
+            };
+            const inserted = await createActions.create<TDoc>(
+              tx,
+              this.table,
+              merged as Partial<TDoc>,
+            );
+            result.upsertedCount += 1;
+            result.upsertedIds[i] = (inserted as Record<string, unknown>)[this.idField];
+          }
+          continue;
+        }
+
+        throw new Error('sqlitekit: bulkWrite encountered an unknown operation shape');
+      }
+
+      return result;
+    });
+  }
+
   // ────────────────────────────────────────────────────────────────────
   // Error classification
   // ────────────────────────────────────────────────────────────────────
@@ -582,6 +1060,44 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
   // ────────────────────────────────────────────────────────────────────
   // Internals
   // ────────────────────────────────────────────────────────────────────
+
+  /**
+   * Normalize an `AggRequest`'s `filter` / `having` slots into Filter IR.
+   * The contract types both as `unknown` so kits accept either an IR node
+   * or a flat-literal predicate (`{ category: 'x' }`); this method does
+   * the coercion once at the Repository boundary so the downstream
+   * compiler always sees a Filter.
+   */
+  #normalizeAggReq(req: AggRequest): AggRequest {
+    const next: AggRequest = { ...req };
+    if (req.filter !== undefined) {
+      next.filter = this.#asFilter(req.filter as Filter | Record<string, unknown>);
+    }
+    if (req.having !== undefined) {
+      next.having = this.#asFilter(req.having as Filter | Record<string, unknown>);
+    }
+    return next;
+  }
+
+  /**
+   * Merge two filter inputs into a single Filter IR node, dropping
+   * `TRUE`-valued sides (so `mergeFilters(undefined, scope)` is just
+   * `scope`). Used by `lookupPopulate` to combine the caller's
+   * `filters` with the policy scope plugins inject through
+   * `context.query`. Returns `undefined` when both sides are absent
+   * so the SQL builder can skip the WHERE clause entirely.
+   */
+  #mergeFilters(
+    a: Filter | Record<string, unknown> | undefined,
+    b: Filter | Record<string, unknown> | undefined,
+  ): Filter | undefined {
+    const fa = this.#asFilter(a);
+    const fb = this.#asFilter(b);
+    if (fa.op === 'true' && fb.op === 'true') return undefined;
+    if (fa.op === 'true') return fb;
+    if (fb.op === 'true') return fa;
+    return { op: 'and' as const, children: Object.freeze([fa, fb]) };
+  }
 
   /** Coerce input into a Filter IR node. Flat records become AND-of-eq. */
   #asFilter(input: Filter | Record<string, unknown> | undefined): Filter {

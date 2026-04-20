@@ -108,3 +108,37 @@ export async function distinct<T = unknown>(
   const rows = await q;
   return rows.map((r) => (r as Record<string, unknown>)['v'] as T);
 }
+
+/**
+ * Fetch by `where`, or INSERT `data` and return the new row when nothing
+ * matches. Mirrors mongokit's `getOrCreate`.
+ *
+ * The implementation is SELECT-then-INSERT (not a native `ON CONFLICT`
+ * upsert) so the `data` payload is only used on the miss path — callers
+ * often want the `where` predicate to carry the lookup keys (e.g. slug)
+ * while `data` carries full-document defaults, and merging the two into
+ * an ON CONFLICT target isn't always well-defined. Wrap the call in a
+ * transaction to close the read-then-write race window.
+ */
+export async function getOrCreate<TDoc>(
+  db: SqliteDb,
+  table: SQLiteTable,
+  where: SQL | undefined,
+  data: Partial<TDoc>,
+): Promise<TDoc> {
+  let q = db.select().from(table).$dynamic();
+  if (where) q = q.where(where);
+  const rows = await q.limit(1);
+  const existing = rows[0];
+  if (existing) return existing as TDoc;
+  const inserted = await db
+    .insert(table)
+    // biome-ignore lint/suspicious/noExplicitAny: Drizzle's values() is parameterized over the inferred insert model; we accept Partial<TDoc> at the boundary.
+    .values(data as any)
+    .returning();
+  const row = inserted[0];
+  if (!row) {
+    throw new Error('sqlitekit/actions/getOrCreate: INSERT RETURNING yielded no row');
+  }
+  return row as TDoc;
+}

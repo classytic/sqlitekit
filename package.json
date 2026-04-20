@@ -34,9 +34,29 @@
       "types": "./dist/driver/pragmas.d.mts",
       "default": "./dist/driver/pragmas.mjs"
     },
+    "./driver/backup": {
+      "types": "./dist/driver/backup.d.mts",
+      "default": "./dist/driver/backup.mjs"
+    },
+    "./plugins/vacuum": {
+      "types": "./dist/plugins/vacuum/index.d.mts",
+      "default": "./dist/plugins/vacuum/index.mjs"
+    },
+    "./plugins/fts": {
+      "types": "./dist/plugins/fts/index.d.mts",
+      "default": "./dist/plugins/fts/index.mjs"
+    },
+    "./plugins/vector": {
+      "types": "./dist/plugins/vector/index.d.mts",
+      "default": "./dist/plugins/vector/index.mjs"
+    },
     "./schema": {
       "types": "./dist/schema/index.d.mts",
       "default": "./dist/schema/index.mjs"
+    },
+    "./schema/crud": {
+      "types": "./dist/schema/crud.d.mts",
+      "default": "./dist/schema/crud.mjs"
     },
     "./batch": {
       "types": "./dist/batch/index.d.mts",
@@ -45,6 +65,10 @@
     "./filter": {
       "types": "./dist/filter/index.d.mts",
       "default": "./dist/filter/index.mjs"
+    },
+    "./query": {
+      "types": "./dist/query/parse.d.mts",
+      "default": "./dist/query/parse.mjs"
     },
     "./actions": {
       "types": "./dist/actions/index.d.mts",
@@ -116,7 +140,7 @@
     "prepublishOnly": "npm run check && npm run build && npm run typecheck && npm test"
   },
   "peerDependencies": {
-    "@classytic/repo-core": "^0.1.0",
+    "@classytic/repo-core": ">=0.1.0",
     "better-sqlite3": ">=11.0.0",
     "drizzle-orm": ">=0.30.0"
   },
@@ -128,19 +152,22 @@
       "optional": true
     }
   },
-  "dependencies": {
-    "@classytic/repo-core": "file:../repo-core"
-  },
   "devDependencies": {
     "@biomejs/biome": "^2.4.12",
+    "@classytic/repo-core": ">=0.1.0",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.1.4",
+    "ajv": "^8.18.0",
+    "ajv-formats": "^3.0.1",
     "better-sqlite3": "^11.0.0",
     "drizzle-kit": "^0.31.10",
     "drizzle-orm": "^0.45.2",
     "tsdown": "^0.21.8",
     "typescript": "^6.0.3",
     "vitest": "^4.1.4"
+  },
+  "optionalDependencies": {
+    "sqlite-vec": "^0.1.9"
   }
 }
