@@ -114,6 +114,169 @@ describe('multiTenantPlugin', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// multiTenantPlugin — allowDataInjection (host stamps tenant on payload)
+// ---------------------------------------------------------------------------
+//
+// Scenario: hosts like arc write the tenant column directly onto the
+// create payload (e.g. `data.organizationId`) rather than routing it
+// through `resolveTenantId`. Before this fix, `requireOnWrite: true` (the
+// default) still threw "resolveTenantId returned undefined" even though
+// the value was already in data and would land on the row. These tests
+// exercise the allowDataInjection fallback, which skips the throw (and
+// the plugin's own stamping) when the payload already carries the tenant.
+
+describe('multiTenantPlugin allowDataInjection', () => {
+  let db: TestDb;
+
+  beforeEach(async () => {
+    db = await makeFixtureDb();
+  });
+
+  afterEach(() => db.close());
+
+  const makeArcRow = (
+    id: string,
+    organizationId: string,
+  ): TestUser & { organizationId: string } => ({ ...makeUser({ id }), organizationId });
+
+  it('accepts a create whose data already carries organizationId (resolver returns undefined)', async () => {
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+    });
+
+    const row = await repo.create(makeArcRow('u1', 'org_payload'));
+    expect((row as TestUser & { organizationId: string }).organizationId).toBe('org_payload');
+  });
+
+  it('does not overwrite a data-supplied tenant with resolver value', async () => {
+    // When the resolver DOES return a value, it wins — this is the
+    // current/expected behavior (context is authoritative). The
+    // allowDataInjection fallback only fires when the resolver is
+    // empty-handed.
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [multiTenantPlugin({ resolveTenantId: () => 'org_resolver' })],
+    });
+
+    const row = await repo.create(makeArcRow('u1', 'org_payload'));
+    expect((row as TestUser & { organizationId: string }).organizationId).toBe('org_resolver');
+  });
+
+  it('throws when neither resolver nor data supply a tenant on a write', async () => {
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+    });
+
+    // The payload has no organizationId. resolveTenantId is empty. The
+    // plugin cannot infer a scope and must refuse.
+    await expect(repo.create(makeUser({ id: 'u1' }))).rejects.toThrow(
+      /resolveTenantId returned undefined/,
+    );
+  });
+
+  it('throws when allowDataInjection is false even if data carries the tenant', async () => {
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [
+        multiTenantPlugin({
+          resolveTenantId: () => undefined,
+          allowDataInjection: false,
+        }),
+      ],
+    });
+
+    // Strict mode — restore pre-fix behavior. The tenant MUST come via
+    // the resolver; a data-stamped value is not enough.
+    await expect(repo.create(makeArcRow('u1', 'org_payload'))).rejects.toThrow(
+      /resolveTenantId returned undefined/,
+    );
+  });
+
+  it('respects data-stamped tenant on createMany when every row has it', async () => {
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+    });
+
+    const rows = await repo.createMany([
+      makeArcRow('u1', 'org_bulk'),
+      makeArcRow('u2', 'org_bulk'),
+    ]);
+    expect(rows).toHaveLength(2);
+    for (const r of rows) {
+      expect((r as TestUser & { organizationId: string }).organizationId).toBe('org_bulk');
+    }
+  });
+
+  it('throws on createMany when only some rows carry the tenant (partial stamping)', async () => {
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+    });
+
+    // Partial stamping is ambiguous — the plugin has no resolver value
+    // to fill the gap — so the safe answer is to refuse.
+    await expect(
+      repo.createMany([makeArcRow('u1', 'org_partial'), makeUser({ id: 'u2' })]),
+    ).rejects.toThrow(/resolveTenantId returned undefined/);
+  });
+
+  it('exposes skipWhen for super-admin bypass', async () => {
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [
+        multiTenantPlugin({
+          resolveTenantId: () => undefined,
+          skipWhen: (ctx) => (ctx as { role?: string }).role === 'superadmin',
+        }),
+      ],
+    });
+
+    // Regular write without tenant — throws.
+    await expect(repo.create(makeUser({ id: 'u1' }))).rejects.toThrow(
+      /resolveTenantId returned undefined/,
+    );
+
+    // Same write via a superadmin context (options bag, which spreads
+    // into the hook context top-level) — skipWhen short-circuits the
+    // plugin before the throw. Tenant stamping is skipped entirely.
+    const row = await repo.create(makeUser({ id: 'u2' }), { role: 'superadmin' });
+    expect(row.id).toBe('u2');
+  });
+
+  it('still runs skipWhen before the data-injection check', async () => {
+    // Prove ordering: skipWhen is consulted first, so a superadmin can
+    // write without stamping regardless of payload contents.
+    let skipWhenCalls = 0;
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [
+        multiTenantPlugin({
+          resolveTenantId: () => undefined,
+          skipWhen: (ctx) => {
+            skipWhenCalls++;
+            return (ctx as { role?: string }).role === 'superadmin';
+          },
+        }),
+      ],
+    });
+
+    await repo.create(makeArcRow('u1', 'org_x'), { role: 'superadmin' });
+    expect(skipWhenCalls).toBeGreaterThan(0);
+  });
+});
+
 describe('softDeletePlugin', () => {
   let db: TestDb;
   let repo: SqliteRepository<TestUser>;
