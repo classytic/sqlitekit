@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-04-21
+
+### Added — `multiTenantPlugin` honors tenant columns already stamped on the payload
+
+New `allowDataInjection: boolean` option on `multiTenantPlugin` (default **`true`**). When set, the plugin no longer throws "resolveTenantId returned undefined" on a write whose `data` / `dataArray` already carries the tenant column. It skips both the `requireOnWrite` throw AND its own stamping, so a host-supplied tenant value is preserved verbatim (not overwritten).
+
+**Why:** hosts like arc stamp the tenant column directly onto the row payload rather than routing it through `resolveTenantId`. Before 0.1.1 every such write tripped the default `requireOnWrite: true`, forcing downstream packages to hand-roll a workaround that inspected `ctx.data[tenantField]` — and `multiTenantPlugin` had no escape hatch for it (no `skipWhen` either). This release closes both gaps.
+
+```ts
+const repo = new SqliteRepository({
+  db,
+  table: usersTable,
+  plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+});
+
+// Works out of the box — plugin sees data.organizationId, skips the throw.
+await repo.create({ id: 'u1', ..., organizationId: 'org_arc' });
+```
+
+### Added — `skipWhen(context, operation)` on `multiTenantPlugin`
+
+Parity with mongokit. Use for role-based bypass (e.g. super-admin) without needing a separate repo instance. Runs before `resolveTenantId` and before the data-injection check, so a `skipWhen: true` short-circuits the plugin entirely:
+
+```ts
+multiTenantPlugin({
+  resolveTenantId: (ctx) => ctx.organizationId as string | undefined,
+  skipWhen: (ctx) => ctx.role === 'superadmin',
+});
+```
+
+**Safety model:**
+
+- The data-injection bypass only fires when `skipWhen` is falsy AND `resolveTenantId` returns undefined. Anything resolved from the resolver still overwrites `data[tenantField]`, so policy upstream cannot be circumvented by payload stamping.
+- On `createMany`, the bypass requires **every** row to carry the tenant column. Partial stamping is ambiguous (no resolver value to fill the gap) and falls through to the `requireOnWrite` throw.
+- Strict pre-0.1.1 behavior is one flag away: pass `allowDataInjection: false`.
+
+**Back-compat:** existing hosts that pass the tenant via `resolveTenantId` are unaffected — the new check only fires when the resolver is empty AND the payload is populated, which used to throw and now succeeds. Read-side scoping (`QUERY_OPS` / `LIST_OPS`) is unchanged.
+
+Test coverage added in `tests/integration/plugins.test.ts` (`multiTenantPlugin allowDataInjection` describe):
+- Single-row data injection (create)
+- Resolver preference over data (no silent-overwrite regression)
+- `createMany` all-or-nothing stamping
+- Strict mode via `allowDataInjection: false`
+- `skipWhen` super-admin bypass + ordering proof
+
 ## [0.1.0] - 2026-04-20 — initial release
 
 ### Added — `repo.explain(filter)` — query planner introspection
