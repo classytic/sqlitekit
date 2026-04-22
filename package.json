@@ -1,6 +1,6 @@
 {
   "name": "@classytic/sqlitekit",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "SQLite repository kit built on @classytic/repo-core — works with better-sqlite3 (Node) and expo-sqlite (React Native) via a pluggable driver interface.",
   "type": "module",
   "sideEffects": false,
@@ -140,7 +140,7 @@
     "prepublishOnly": "npm run check && npm run build && npm run typecheck && npm test"
   },
   "peerDependencies": {
-    "@classytic/repo-core": ">=0.1.0",
+    "@classytic/repo-core": ">=0.2.0",
     "better-sqlite3": ">=11.0.0",
     "drizzle-orm": ">=0.30.0"
   },
