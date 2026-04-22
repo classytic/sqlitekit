@@ -26,6 +26,7 @@
  * even though their query backends differ.
  */
 
+import type { RepositoryContext } from '@classytic/repo-core/context';
 import type { Filter } from '@classytic/repo-core/filter';
 import { isFilter, TRUE } from '@classytic/repo-core/filter';
 import type { OffsetPaginationResult } from '@classytic/repo-core/pagination';
@@ -45,7 +46,13 @@ import type {
   WriteOptions,
 } from '@classytic/repo-core/repository';
 import { RepositoryBase, type RepositoryBaseOptions } from '@classytic/repo-core/repository';
-import { asc, desc, getTableColumns, getTableName } from 'drizzle-orm';
+import {
+  compileUpdateSpecToSql,
+  isUpdatePipeline,
+  isUpdateSpec,
+  type UpdateInput,
+} from '@classytic/repo-core/update';
+import { asc, desc, getTableColumns, getTableName, sql } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
 import { countAggGroups, executeAgg } from '../actions/aggregate/index.js';
 import * as createActions from '../actions/create.js';
@@ -174,6 +181,34 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
   // MinimalRepo surface
   // ────────────────────────────────────────────────────────────────────
 
+  /**
+   * Run a Repository operation under the standard envelope:
+   *   - invoke `fn`, emit `after:<op>` with the result on success
+   *   - emit `error:<op>` and rethrow on failure
+   *
+   * Methods with branched in-try logic that emit `after:*` from multiple
+   * paths (`delete`, `aggregatePaginate`) intentionally keep their inline
+   * try/catch. Methods that currently emit `after:*` without an `error:*`
+   * counterpart (`count`, `exists`, `findAll`, `updateMany`, `deleteMany`,
+   * `upsert`, `distinct`) are also left untouched — wrapping them would
+   * silently introduce error-hook emission, which is a behavior change
+   * for a separate decision.
+   */
+  private async _runOp<T>(
+    op: string,
+    context: RepositoryContext,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      const result = await fn();
+      await this._emitAfter(op, context, result);
+      return result;
+    } catch (err) {
+      await this._emitError(op, context, err as Error);
+      throw err;
+    }
+  }
+
   async getAll(params: PaginationParams<TDoc> = {}, options: QueryOptions = {}): Promise<unknown> {
     const context = await this._buildContext('getAll', {
       filters: params.filters,
@@ -187,7 +222,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       await this._emitAfter('getAll', context, cached);
       return cached;
     }
-    try {
+    return this._runOp('getAll', context, () => {
       const filter = this.#asFilter(
         (context.filters ?? params.filters) as Filter | Record<string, unknown> | undefined,
       );
@@ -198,18 +233,13 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       const limit = Math.max(1, Math.min((context['limit'] ?? params.limit ?? 20) as number, 1000));
       const page = Math.max(1, (context['page'] ?? params.page ?? 1) as number);
 
-      const result = await this.pagination.paginate<TDoc>({
+      return this.pagination.paginate<TDoc>({
         ...(where !== undefined ? { where } : {}),
         sort,
         page,
         limit,
       });
-      await this._emitAfter('getAll', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('getAll', context, err as Error);
-      throw err;
-    }
+    });
   }
 
   async getById(id: string, options: QueryOptions = {}): Promise<TDoc | null> {
@@ -219,44 +249,27 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       await this._emitAfter('getById', context, cached);
       return cached;
     }
-    try {
+    return this._runOp('getById', context, () => {
       const scope = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
       const scopeWhere = compileFilterToDrizzle(scope, this.table);
-      const result = await readActions.getById<TDoc>(
-        this.db,
-        this.table,
-        this.idColumn,
-        id,
-        scopeWhere,
-      );
-      await this._emitAfter('getById', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('getById', context, err as Error);
-      throw err;
-    }
+      return readActions.getById<TDoc>(this.db, this.table, this.idColumn, id, scopeWhere);
+    });
   }
 
   async create(data: Partial<TDoc>, options: WriteOptions = {}): Promise<TDoc> {
     const context = await this._buildContext('create', { data, ...options });
-    try {
-      const payload = (context.data ?? data) as Partial<TDoc>;
-      const result = await createActions.create<TDoc>(this.db, this.table, payload);
-      await this._emitAfter('create', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('create', context, err as Error);
-      throw err;
-    }
+    return this._runOp('create', context, () =>
+      createActions.create<TDoc>(this.db, this.table, (context.data ?? data) as Partial<TDoc>),
+    );
   }
 
   async update(id: string, data: Partial<TDoc>, options: WriteOptions = {}): Promise<TDoc | null> {
     const context = await this._buildContext('update', { id, data, ...options });
-    try {
+    return this._runOp('update', context, () => {
       const payload = (context.data ?? data) as Partial<TDoc>;
       const scope = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
       const scopeWhere = compileFilterToDrizzle(scope, this.table);
-      const result = await updateActions.updateById<TDoc>(
+      return updateActions.updateById<TDoc>(
         this.db,
         this.table,
         this.idColumn,
@@ -264,12 +277,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
         payload,
         scopeWhere,
       );
-      await this._emitAfter('update', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('update', context, err as Error);
-      throw err;
-    }
+    });
   }
 
   async delete(id: string, options: DeleteOptions = {}): Promise<DeleteResult> {
@@ -327,16 +335,11 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       await this._emitAfter('getOne', context, cached);
       return cached;
     }
-    try {
+    return this._runOp('getOne', context, () => {
       const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
       const where = compileFilterToDrizzle(f, this.table);
-      const result = await readActions.getOne<TDoc>(this.db, this.table, where);
-      await this._emitAfter('getOne', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('getOne', context, err as Error);
-      throw err;
-    }
+      return readActions.getOne<TDoc>(this.db, this.table, where);
+    });
   }
 
   async count(
@@ -378,44 +381,57 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
   async createMany(items: Partial<TDoc>[], options: WriteOptions = {}): Promise<TDoc[]> {
     const context = await this._buildContext('createMany', { dataArray: items, ...options });
     if (items.length === 0) return [];
-    try {
+    return this._runOp('createMany', context, () => {
       const payload = (context.dataArray ?? items) as Partial<TDoc>[];
       // Wrap in a transaction so a partial failure rolls back the whole
       // batch — Drizzle's `db.transaction` is the portable boundary
       // (vs. the previous bind-to-driver dance for raw SQL).
-      const result = await withManualTransaction(this.db, async (tx) => {
-        return createActions.createMany<TDoc>(tx, this.table, payload);
-      });
-      await this._emitAfter('createMany', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('createMany', context, err as Error);
-      throw err;
-    }
+      return withManualTransaction(this.db, (tx) =>
+        createActions.createMany<TDoc>(tx, this.table, payload),
+      );
+    });
   }
 
   async findOneAndUpdate(
     filter: Record<string, unknown> | Filter,
-    update: Record<string, unknown>,
+    update: UpdateInput,
     options: {
       sort?: Record<string, 1 | -1>;
       returnDocument?: 'before' | 'after';
       upsert?: boolean;
     } = {},
   ): Promise<TDoc | null> {
+    // Aggregation-pipeline updates are Mongo-only — SQLite has no native
+    // equivalent. Fail loudly so callers migrate to `UpdateSpec` (which
+    // handles the common `$set` / `$unset` / `$inc` / `$setOnInsert`
+    // cases portably) or accept that the call stays kit-native.
+    if (isUpdatePipeline(update)) {
+      throw new Error(
+        'sqlitekit: aggregation pipeline updates are not supported. ' +
+          'Use an `UpdateSpec` from `@classytic/repo-core/update` for portable ' +
+          'updates, or a flat column record for kit-native writes — SQLite has ' +
+          'no equivalent to MongoDB aggregation-pipeline updates.',
+      );
+    }
+
+    // Route portable Update IR to a Drizzle-friendly record once. The
+    // UPDATE branch uses `updateData`; the upsert INSERT branch uses
+    // `insertData` (different semantics for `inc` and `setOnInsert`).
+    const { updateData, insertData } = this.#compileUpdateInput(update);
+
     const context = await this._buildContext('findOneAndUpdate', {
       query: filter,
-      data: update,
+      data: updateData,
       ...options,
     });
-    try {
+    return this._runOp('findOneAndUpdate', context, () => {
       const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
       const where = compileFilterToDrizzle(f, this.table);
       const orderBy = this.#asSortKeys(options.sort).map((s) =>
         s.direction === 'asc' ? asc(s.column) : desc(s.column),
       );
 
-      const result = await withManualTransaction(this.db, async (tx) => {
+      return withManualTransaction(this.db, async (tx) => {
         const txDb = tx;
         if (where === undefined) {
           // No predicate at all — use the table's PK column to enforce
@@ -436,30 +452,37 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
         if (found) return found;
         if (!options.upsert) return null;
         // Upsert path — merge filter literals (when the filter is a flat
-        // record) with the update data and INSERT.
+        // record) with the INSERT-branch update data and INSERT. When
+        // hooks have mutated `context.data`, prefer the mutated form for
+        // the UPDATE-branch fields; INSERT-only fields (`setOnInsert`,
+        // inc-as-literal) come straight from the IR.
         const merged: Record<string, unknown> = {
           ...(typeof filter === 'object' && filter !== null && !isFilter(filter) ? filter : {}),
-          ...(context.data as Record<string, unknown>),
+          ...((context.data as Record<string, unknown>) ?? {}),
+          ...(insertData ?? {}),
         };
         return createActions.create<TDoc>(txDb, this.table, merged as Partial<TDoc>);
       });
-
-      await this._emitAfter('findOneAndUpdate', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('findOneAndUpdate', context, err as Error);
-      throw err;
-    }
+    });
   }
 
   async updateMany(
     filter: Record<string, unknown> | Filter,
-    update: Record<string, unknown>,
+    update: UpdateInput,
     options: WriteOptions = {},
   ): Promise<{ acknowledged: true; matchedCount: number; modifiedCount: number }> {
+    if (isUpdatePipeline(update)) {
+      throw new Error(
+        'sqlitekit: aggregation pipeline updates are not supported. ' +
+          'Use an `UpdateSpec` from `@classytic/repo-core/update` or a flat column record.',
+      );
+    }
+    // `updateMany` has no INSERT branch — discard `insertData`.
+    const { updateData } = this.#compileUpdateInput(update);
+
     const context = await this._buildContext('updateMany', {
       query: filter,
-      data: update,
+      data: updateData,
       ...options,
     });
     const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
@@ -479,6 +502,66 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     const envelope = { acknowledged: true as const, ...result };
     await this._emitAfter('updateMany', context, envelope);
     return envelope;
+  }
+
+  /**
+   * Normalize a portable `UpdateInput` into Drizzle-ready records.
+   *
+   * Returns two shapes:
+   *
+   *   - `updateData` — goes into `UPDATE ... SET`. Set fields land as
+   *     literal values; unset fields become `NULL`; inc fields become
+   *     `coalesce(col, 0) + delta` SQL fragments.
+   *   - `insertData` — only populated when the input is an `UpdateSpec`
+   *     AND the caller might take the upsert INSERT branch. Includes
+   *     `setOnInsert` fields and inc values as literal deltas (not
+   *     expressions — the row doesn't exist yet).
+   *
+   * Raw records pass through as `updateData` with `insertData: null`,
+   * preserving back-compat for callers that already hand-built flat
+   * column records.
+   */
+  #compileUpdateInput(update: UpdateInput): {
+    updateData: Record<string, unknown>;
+    insertData: Record<string, unknown> | null;
+  } {
+    if (!isUpdateSpec(update)) {
+      return {
+        updateData: update as Record<string, unknown>,
+        insertData: null,
+      };
+    }
+
+    const plan = compileUpdateSpecToSql(update);
+    const columns = getTableColumns(this.table) as Record<string, SQLiteColumn | undefined>;
+
+    // UPDATE branch — literal sets + NULLs + SQL-expression increments.
+    const updateData: Record<string, unknown> = { ...plan.data };
+    for (const col of plan.unset) updateData[col] = null;
+    if (Object.keys(plan.inc).length > 0) {
+      for (const [col, delta] of Object.entries(plan.inc)) {
+        const column = columns[col];
+        if (!column) {
+          throw new Error(
+            `sqlitekit: Update IR inc references unknown column '${col}' on table '${getTableName(this.table)}'`,
+          );
+        }
+        // `coalesce(col, 0) + ?` handles NULL start-state — counters begin at 0
+        // instead of staying NULL forever. Matches sqlitekit's `increment()`.
+        updateData[col] = sql`coalesce(${column}, 0) + ${delta}`;
+      }
+    }
+
+    // INSERT branch — inc values become literal deltas (no prior value to
+    // add to). `setOnInsert` joins the merge. `unset` is omitted since
+    // schema defaults already apply on insert.
+    const hasInsertOnly =
+      Object.keys(plan.insertDefaults).length > 0 || Object.keys(plan.inc).length > 0;
+    const insertData: Record<string, unknown> | null = hasInsertOnly
+      ? { ...plan.insertDefaults, ...plan.inc }
+      : null;
+
+    return { updateData, insertData };
   }
 
   async deleteMany(
@@ -534,15 +617,11 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     req: AggRequest,
   ): Promise<AggResult<TRow>> {
     const context = await this._buildContext('aggregate', { aggRequest: req });
-    try {
+    return this._runOp('aggregate', context, async () => {
       const rows = await executeAgg<TRow>(this.db, this.table, this.#normalizeAggReq(req));
       const result: AggResult<TRow> = { rows };
-      await this._emitAfter('aggregate', context, result);
       return result;
-    } catch (err) {
-      await this._emitError('aggregate', context, err as Error);
-      throw err;
-    }
+    });
   }
 
   /**
@@ -664,7 +743,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       select: options.select,
       countStrategy: options.countStrategy,
     });
-    try {
+    return this._runOp('lookupPopulate', context, () => {
       // Plugin scope (multi-tenant orgId, soft-delete tombstone) is
       // injected via `context.filters` / `context.query`. Merge with
       // the caller's filter so policy stays enforced under joins.
@@ -674,7 +753,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
         | undefined;
       const policyScope = context.query as Filter | Record<string, unknown> | undefined;
       const filter = this.#mergeFilters(callerFilter, policyScope);
-      const result = await executeLookup<TDoc, TExtra>({
+      return executeLookup<TDoc, TExtra>({
         db: this.db,
         baseTable: this.table,
         basePkColumns: [this.idColumn],
@@ -682,12 +761,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
         ...(filter !== undefined ? { filter } : { filter: undefined }),
         options,
       });
-      await this._emitAfter('lookupPopulate', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('lookupPopulate', context, err as Error);
-      throw err;
-    }
+    });
   }
 
   async distinct<T = unknown>(
@@ -732,19 +806,14 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       data,
       ...options,
     });
-    try {
+    return this._runOp('getOrCreate', context, () => {
       const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
       const where = compileFilterToDrizzle(f, this.table);
       const payload = (context.data ?? data) as Partial<TDoc>;
-      const result = await withManualTransaction(this.db, async (tx) =>
+      return withManualTransaction(this.db, (tx) =>
         readActions.getOrCreate<TDoc>(tx, this.table, where, payload),
       );
-      await this._emitAfter('getOrCreate', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('getOrCreate', context, err as Error);
-      throw err;
-    }
+    });
   }
 
   /**

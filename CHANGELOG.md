@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-04-22
+
+### Added — portable Update IR dispatch in `findOneAndUpdate` + `updateMany`
+
+- `SqliteRepository.findOneAndUpdate(filter, update, options)` and
+  `updateMany(filter, update, options)` now accept the new `UpdateInput`
+  shape from `@classytic/repo-core/update`.
+- An `UpdateSpec` (built via `update({ set, unset, inc, setOnInsert })` /
+  `setFields(...)` / `incFields(...)` / `unsetFields(...)` /
+  `setOnInsertFields(...)`) compiles to:
+  - **UPDATE branch:** literal column writes for `set`, `NULL` writes for
+    `unset`, and `SET col = coalesce(col, 0) + ?` Drizzle SQL for `inc`
+    (NULL-safe increment that matches sqlitekit's existing `increment()`).
+  - **INSERT branch (upsert):** `set` + `setOnInsert` + `inc` as literal
+    deltas (no `coalesce` — the row doesn't exist yet).
+- Flat column records (`{ role: 'admin' }`) continue to pass through as
+  before — 100% backward-compatible.
+- Mongo aggregation pipeline updates (array form) are rejected with a
+  clear error pointing at `UpdateSpec` or kit-native alternatives —
+  SQLite has no equivalent primitive.
+- **Why:** arc's infrastructure stores (outbox, idempotency, audit) used
+  Mongo operator records directly, which would have set a literal column
+  named `$set` on sqlitekit. The IR closes the gap so the same store
+  adapter code runs identically on mongokit and sqlitekit.
+- **Peer dep bump:** `@classytic/repo-core` >= 0.2.0.
+
 ## [0.1.1] - 2026-04-21
 
 ### Added — `multiTenantPlugin` honors tenant columns already stamped on the payload
