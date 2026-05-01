@@ -1,6 +1,6 @@
 {
   "name": "@classytic/sqlitekit",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "SQLite repository kit built on @classytic/repo-core — works with better-sqlite3 (Node) and expo-sqlite (React Native) via a pluggable driver interface.",
   "type": "module",
   "sideEffects": false,
@@ -137,10 +137,13 @@
     "lint": "biome check src tests",
     "lint:fix": "biome check src tests --write",
     "check": "biome ci src tests --diagnostic-level=error",
-    "prepublishOnly": "npm run check && npm run build && npm run typecheck && npm test"
+    "prepublishOnly": "npm run check && npm run build && npm run typecheck && npm test",
+    "push": "classytic-push",
+    "release:tag": "node -e \"require('child_process').execSync('npm run push -- v'+require('./package.json').version,{stdio:'inherit'})\"",
+    "release": "npm run push -- main && npm run release:tag && npm publish"
   },
   "peerDependencies": {
-    "@classytic/repo-core": ">=0.2.0",
+    "@classytic/repo-core": ">=0.3.0",
     "better-sqlite3": ">=11.0.0",
     "drizzle-orm": ">=0.30.0"
   },
@@ -154,7 +157,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.12",
-    "@classytic/repo-core": ">=0.2.0",
+    "@classytic/dev-tools": "^0.2.0",
+    "@classytic/repo-core": "^0.3.0",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.1.4",
