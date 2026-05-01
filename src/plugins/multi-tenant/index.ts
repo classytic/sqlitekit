@@ -10,6 +10,7 @@
 import { buildTenantScope } from '@classytic/repo-core/filter';
 import { HOOK_PRIORITY } from '@classytic/repo-core/hooks';
 import type { Plugin, RepositoryBase } from '@classytic/repo-core/repository';
+import type { TenantConfig } from '@classytic/repo-core/tenant';
 
 type Context = Record<string, unknown> & {
   operation: string;
@@ -19,9 +20,19 @@ type Context = Record<string, unknown> & {
   dataArray?: Record<string, unknown>[];
 };
 
-export interface MultiTenantOptions {
-  /** Column holding the tenant id. Default: `'organizationId'`. */
-  tenantField?: string;
+/**
+ * The static `tenantField` is picked from `@classytic/repo-core/tenant` to
+ * lock the org-wide vocabulary by structural typing. Sqlitekit-specific
+ * runtime fields stay local — `resolveTenantId` (returns id from a richer
+ * SQL context, distinct from mongokit's `resolveContext`), `requireOnWrite`
+ * (write-path-only "must resolve" semantics — narrower than repo-core's
+ * `required` which spans reads + writes), `skipWhen`, `allowDataInjection`.
+ *
+ * The `fieldType` / `ref` / `contextKey` static fields aren't picked because
+ * SQL kits handle column typing through the schema layer, not a runtime
+ * cast — different mechanism than mongoose's `Schema.Types.ObjectId` opt-in.
+ */
+export interface MultiTenantOptions extends Pick<TenantConfig, 'tenantField'> {
   /** Pull the current tenant id from the hook context. Return `undefined` to skip. */
   resolveTenantId: (context: Context) => string | number | undefined;
   /** Throw if resolver returns undefined on a mutating op. Default: true. */

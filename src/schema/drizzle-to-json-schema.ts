@@ -32,6 +32,7 @@ import {
   collectFieldsToOmit,
   type JsonSchema,
   type SchemaBuilderOptions,
+  type SchemaGenerator,
 } from '@classytic/repo-core/schema';
 import { getTableColumns } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
@@ -55,6 +56,12 @@ type ColumnLike = SQLiteColumn & {
  *
  * Output matches `CrudSchemas` from `@classytic/repo-core/schema` — the same
  * shape every kit emits — so HTTP layers stay backend-agnostic.
+ *
+ * Satisfies the canonical `SchemaGenerator<SQLiteTable>` contract from
+ * `@classytic/repo-core/schema`, so arc's `DrizzleAdapter.schemaGenerator`
+ * field accepts this function directly with no glue. Future SQL kits
+ * (postgres-kit, etc.) implementing the same contract are interchangeable
+ * at the adapter boundary.
  */
 export function buildCrudSchemasFromTable(
   table: SQLiteTable,
@@ -69,6 +76,12 @@ export function buildCrudSchemasFromTable(
 
   return { createBody, updateBody, params, listQuery };
 }
+
+// Compile-time conformance check — surfaces drift the moment sqlitekit's
+// signature diverges from repo-core's `SchemaGenerator<TModel>` contract.
+// Same pattern as mongokit's conformance assertion.
+const _conformance: SchemaGenerator<SQLiteTable> = buildCrudSchemasFromTable;
+void _conformance;
 
 /**
  * Convert a single Drizzle column into a JSON Schema fragment.

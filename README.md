@@ -149,6 +149,8 @@ const r2: MinimalRepo<User> = mongoRepo;  // ← also compiles
 
 The full surface includes the StandardRepo extensions: `findOneAndUpdate`, `updateMany`, `deleteMany`, `upsert`, `increment`, `aggregate`, `distinct`, `withTransaction`, `withBatch`, `isDuplicateKeyError`.
 
+Pagination result types (`OffsetPaginationResult`, `KeysetPaginationResult`, `AggregatePaginationResult`, `PaginationResult`), tenant config (`TenantConfig`, `resolveTenantConfig`), and error contracts (`HttpError`, `ErrorContract`, `toErrorContract`) all flow from `@classytic/repo-core/*` — sqlitekit re-exports nothing, hosts import directly from repo-core. `multiTenantPlugin`'s options interface `extends Pick<TenantConfig, 'tenantField' | 'contextKey' | 'required'>` from repo-core. `buildCrudSchemasFromTable` ships a compile-time `SchemaGenerator<TModel>` conformance assertion so it plugs into `createDrizzleAdapter({ schemaGenerator: buildCrudSchemasFromTable })` without casts.
+
 ## Atomicity primitives — `batch` vs `transaction`
 
 Two choices, picked by your environment + use case:

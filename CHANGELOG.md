@@ -7,6 +7,16 @@ adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.2.0] - 2026-04-22
 
+### `SchemaGenerator<SQLiteTable>` conformance
+
+`buildCrudSchemasFromTable` ships a compile-time conformance assertion against repo-core's canonical `SchemaGenerator<SQLiteTable>` contract. Drift between sqlitekit's signature and the org-wide interface fails sqlitekit's typecheck before any arc / consumer sees it. Same pattern as mongokit's conformance gate.
+
+### Tenant config alignment + repo-core peer bump
+
+`MultiTenantOptions` now extends `Pick<TenantConfig, 'tenantField'>` from `@classytic/repo-core/tenant` to lock the field vocabulary to the org-wide canonical contract. Sqlitekit-specific runtime fields (`resolveTenantId`, `requireOnWrite`, `skipWhen`, `allowDataInjection`) stay local — `RepositoryContext` shapes genuinely differ from mongokit's. Peer dep `@classytic/repo-core` bumped `>=0.2.0` → `>=0.3.0`.
+
+Drizzle adapter integration unchanged. `multiTenantPlugin({ tenantField: '...', resolveTenantId: ... })` calls work identically.
+
 ### Added — portable Update IR dispatch in `findOneAndUpdate` + `updateMany`
 
 - `SqliteRepository.findOneAndUpdate(filter, update, options)` and
