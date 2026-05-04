@@ -103,6 +103,18 @@ const DEFAULT_INTERVAL_MS = 60_000;
  */
 export function ttlPlugin(options: TtlOptions): Plugin {
   const field = options.field;
+  // Hard validate the field name — it lands inside SQL DDL (trigger
+  // creation) and DML (sweep DELETE). Construction-time options are
+  // typically literal strings written by the host, but a downstream
+  // meta-system that derives the field from environment / schema
+  // introspection would create an injection surface here. Cheap defense.
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field)) {
+    throw new Error(
+      `[ttl] field name "${field}" is invalid — must match /^[A-Za-z_][A-Za-z0-9_]*$/. ` +
+        `TTL field names are interpolated directly into trigger DDL and DELETE SQL; ` +
+        `non-identifier characters are refused as a defense against injection.`,
+    );
+  }
   const expireAfterSeconds = options.expireAfterSeconds ?? 0;
   const mode = options.mode ?? 'scheduled';
   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;

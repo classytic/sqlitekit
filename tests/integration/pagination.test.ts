@@ -57,12 +57,12 @@ describe('PaginationEngine — offset mode', () => {
       limit: 10,
     });
     expect(page.method).toBe('offset');
-    expect(page.docs).toHaveLength(10);
+    expect(page.data).toHaveLength(10);
     expect(page.total).toBe(25);
     expect(page.pages).toBe(3);
     expect(page.hasNext).toBe(true);
     expect(page.hasPrev).toBe(false);
-    expect(page.docs[0]?.id).toBe('u00');
+    expect(page.data[0]?.id).toBe('u00');
   });
 
   it('handles the trailing partial page', async () => {
@@ -71,10 +71,10 @@ describe('PaginationEngine — offset mode', () => {
       page: 3,
       limit: 10,
     });
-    expect(page.docs).toHaveLength(5);
+    expect(page.data).toHaveLength(5);
     expect(page.hasNext).toBe(false);
     expect(page.hasPrev).toBe(true);
-    expect(page.docs[0]?.id).toBe('u20');
+    expect(page.data[0]?.id).toBe('u20');
   });
 
   it('countStrategy: "none" skips the count(*) and uses LIMIT+1 peeking', async () => {
@@ -86,7 +86,7 @@ describe('PaginationEngine — offset mode', () => {
     });
     expect(page.total).toBe(0);
     expect(page.pages).toBe(0);
-    expect(page.docs).toHaveLength(10);
+    expect(page.data).toHaveLength(10);
     // Peek says "more rows exist" because we're on page 1 of 3.
     expect(page.hasNext).toBe(true);
   });
@@ -123,7 +123,7 @@ describe('PaginationEngine — keyset mode', () => {
         ...(cursor !== undefined ? { after: cursor } : {}),
         limit: 5,
       });
-      for (const row of page.docs) seen.push(row.id);
+      for (const row of page.data) seen.push(row.id);
       if (!page.hasMore) break;
       if (page.next === null) break;
       cursor = page.next;
@@ -139,14 +139,14 @@ describe('PaginationEngine — keyset mode', () => {
       sort: [{ column: usersTable.id, direction: 'desc' }],
       limit: 5,
     });
-    expect(first.docs.map((r) => r.id)).toEqual(['u12', 'u11', 'u10', 'u09', 'u08']);
+    expect(first.data.map((r) => r.id)).toEqual(['u12', 'u11', 'u10', 'u09', 'u08']);
     expect(first.hasMore).toBe(true);
     const second = await engine.stream<TestUser>({
       sort: [{ column: usersTable.id, direction: 'desc' }],
       after: first.next ?? '',
       limit: 5,
     });
-    expect(second.docs[0]?.id).toBe('u07');
+    expect(second.data[0]?.id).toBe('u07');
   });
 
   it('returns hasMore=false + next=null on the last page', async () => {

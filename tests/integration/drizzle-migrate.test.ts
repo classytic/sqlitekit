@@ -25,11 +25,21 @@ describe('fromDrizzleDir + createMigrator — fixture migrations', () => {
     try {
       const driver = createBetterSqlite3Driver(db);
       const migrations = await fromDrizzleDir({ dir: fixtureMigrationsDir });
-      expect(migrations.map((m) => m.name)).toEqual(['0000_init', '0001_lookup_tables']);
+      expect(migrations.map((m) => m.name)).toEqual([
+        '0000_init',
+        '0001_lookup_tables',
+        '0002_field_grade_tables',
+        '0003_runs_compound_columns',
+      ]);
 
       const migrator = createMigrator({ driver, migrations });
       const applied = await migrator.up();
-      expect(applied).toEqual(['0000_init', '0001_lookup_tables']);
+      expect(applied).toEqual([
+        '0000_init',
+        '0001_lookup_tables',
+        '0002_field_grade_tables',
+        '0003_runs_compound_columns',
+      ]);
 
       const tables = db
         .prepare(
@@ -41,11 +51,14 @@ describe('fromDrizzleDir + createMigrator — fixture migrations', () => {
         'departments',
         'employee_tasks',
         'employees',
+        'outbox',
         'posts',
+        'runs',
         'sessions',
         'sqlite_sequence',
         'tasks',
         'users',
+        'versioned_orders',
       ]);
 
       // Re-running `up()` is a no-op — the tracking row prevents re-application.
@@ -67,11 +80,13 @@ describe('fromDrizzleDir + createMigrator — fixture migrations', () => {
       expect(before).toEqual([
         { name: '0000_init', applied: false },
         { name: '0001_lookup_tables', applied: false },
+        { name: '0002_field_grade_tables', applied: false },
+        { name: '0003_runs_compound_columns', applied: false },
       ]);
 
       await migrator.up();
       const after = await migrator.status();
-      expect(after).toHaveLength(2);
+      expect(after).toHaveLength(4);
       expect(after.every((r) => r.applied)).toBe(true);
       expect(after[0]?.appliedAt).toBeTypeOf('string');
     } finally {
@@ -126,10 +141,40 @@ describe('fromDrizzleDir + createMigrator — fixture migrations', () => {
         join(downDir, '0001_lookup_tables.sql'),
         'DROP TABLE IF EXISTS `employee_tasks`;\n--> statement-breakpoint\nDROP TABLE IF EXISTS `employees`;\n--> statement-breakpoint\nDROP TABLE IF EXISTS `departments`;\n',
       );
+      // Same reasoning for the third migration introduced alongside the
+      // claim / claimVersion / cursor / lease primitives — without a
+      // matching down() the rollback path refuses to start.
+      await writeFile(
+        join(downDir, '0002_field_grade_tables.sql'),
+        'DROP TABLE IF EXISTS `outbox`;\n--> statement-breakpoint\nDROP TABLE IF EXISTS `versioned_orders`;\n--> statement-breakpoint\nDROP TABLE IF EXISTS `runs`;\n',
+      );
+      // Fourth migration introduced alongside the compound-CAS contract
+      // additions (`paused` + `retryAfter` ALTERs). The down rebuilds
+      // `runs` without those columns. SQLite has no `DROP COLUMN`
+      // before 3.35 — and even after, dropping is a table-rewrite, so
+      // we just rebuild from scratch in the rollback path.
+      await writeFile(
+        join(downDir, '0003_runs_compound_columns.sql'),
+        [
+          'DROP TABLE IF EXISTS `runs`;',
+          'CREATE TABLE `runs` (',
+          '\t`id` text PRIMARY KEY NOT NULL,',
+          '\t`organizationId` text,',
+          '\t`status` text NOT NULL,',
+          '\t`workerId` text,',
+          '\t`lastHeartbeat` text,',
+          '\t`retries` integer,',
+          '\t`deletedAt` text,',
+          '\t`createdAt` text NOT NULL',
+          ');',
+        ].join('\n'),
+      );
 
       const migrations = await fromDrizzleDir({ dir: upDir, down: downDir });
       expect(migrations[0]?.down).toBeDefined();
       expect(migrations[1]?.down).toBeDefined();
+      expect(migrations[2]?.down).toBeDefined();
+      expect(migrations[3]?.down).toBeDefined();
 
       const db = new Database(':memory:');
       try {

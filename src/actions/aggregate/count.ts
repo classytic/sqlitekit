@@ -22,20 +22,43 @@ import { getTableColumns, sql } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
 import { compileFilterToDrizzle } from '../../filter/compile.js';
 import type { SqliteDb } from '../../repository/types.js';
-import { executeAgg } from './execute.js';
+import { type ExecuteAggOptions, executeAgg } from './execute.js';
 import { normalizeGroupBy } from './normalize.js';
 
 export async function countAggGroups(
   db: SqliteDb,
   table: SQLiteTable,
   req: AggRequest,
+  options: ExecuteAggOptions = {},
 ): Promise<number> {
   const columns = getTableColumns(table) as Record<string, SQLiteColumn>;
   const groupCols = normalizeGroupBy(req.groupBy);
 
-  // Strategy 1: HAVING → run + count.
-  if (req.having) {
-    const rows = await executeAgg(db, table, req);
+  // Strategy 1: HAVING / lookups / dotted-path groupBy / dateBuckets
+  // → run the full aggregate and count rows. The shortcut Strategy 3
+  // below can't handle these cases — lookups need joins applied
+  // before grouping, dotted-path columns need the alias-aware
+  // resolver, and dateBuckets need their `strftime`-emitting SQL
+  // expression built per-bucket. Re-using `executeAgg` keeps the
+  // count consistent with the data pipeline instead of risking
+  // divergence.
+  const hasDottedGroupBy = groupCols.some((f) => f.includes('.'));
+  const hasDateBuckets = !!req.dateBuckets && Object.keys(req.dateBuckets).length > 0;
+  const requiresFullAgg =
+    req.having !== undefined ||
+    (req.lookups !== undefined && req.lookups.length > 0) ||
+    hasDottedGroupBy ||
+    hasDateBuckets;
+  if (requiresFullAgg) {
+    // Strip pagination knobs — the count must observe the FULL grouped
+    // result set, not the slice the caller is paging through. Without
+    // this, `aggregatePaginate({ limit: 2 })` would count `2` instead
+    // of the true distinct-group cardinality.
+    const { limit: _limit, offset: _offset, sort: _sort, ...countReq } = req;
+    void _limit;
+    void _offset;
+    void _sort;
+    const rows = await executeAgg(db, table, countReq, options);
     return rows.length;
   }
 

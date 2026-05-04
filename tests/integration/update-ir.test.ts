@@ -136,7 +136,7 @@ describe('SqliteRepository — Update IR dispatch', () => {
       await repo.updateMany(eq('role', 'reader'), incFields({ age: 5 }));
 
       const all = await repo.getAll();
-      const ages = (all as unknown as { docs: TestUser[] }).docs
+      const ages = (all as unknown as { docs: TestUser[] }).data
         .map((d) => d.age)
         .filter((a): a is number => typeof a === 'number')
         .sort((a, b) => a - b);

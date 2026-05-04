@@ -133,3 +133,54 @@ export const postsTable = sqliteTable('posts', {
 });
 
 export type PostRow = typeof postsTable.$inferSelect;
+
+/**
+ * Field-grade fixtures used by the new claim / claimVersion / cursor /
+ * lease / middleware tests. Mirrors mongokit 3.13.0's test schemas one-
+ * to-one so the suites stay parallel: `runs` exercises status-state CAS,
+ * `versionedOrders` exercises version-stamp CAS, and `outboxLease`
+ * exercises the lease plugin's FIFO claim semantics.
+ */
+export const runsTable = sqliteTable('runs', {
+  id: text('id').primaryKey(),
+  organizationId: text('organizationId'),
+  status: text('status').notNull(),
+  workerId: text('workerId'),
+  lastHeartbeat: text('lastHeartbeat'),
+  retries: integer('retries'),
+  // Compound-CAS tests use `paused` (boolean-as-int) for the
+  // paused-guard predicate, and `retryAfter` (ISO string) for the
+  // retry-time guard. Both nullable — only the compound-claim tests
+  // populate them.
+  paused: integer('paused', { mode: 'boolean' }),
+  retryAfter: text('retryAfter'),
+  deletedAt: text('deletedAt'),
+  createdAt: text('createdAt').notNull(),
+});
+
+export const versionedOrdersTable = sqliteTable('versioned_orders', {
+  id: text('id').primaryKey(),
+  organizationId: text('organizationId'),
+  status: text('status').notNull(),
+  // `version` is nullable to exercise the `claimVersion({ from: undefined })`
+  // first-write CAS path — fresh-from-DB POJOs that lack a version
+  // default need to be claimable on first write. The default 0 still
+  // applies on `repo.create({...})` because `makeOrder` populates it.
+  version: integer('version').default(0),
+  total: integer('total'),
+  reads: integer('reads').notNull().default(0),
+  createdAt: text('createdAt').notNull(),
+});
+
+export const outboxLeaseTable = sqliteTable('outbox', {
+  id: text('id').primaryKey(),
+  status: text('status').notNull(),
+  payload: text('payload').notNull(),
+  leasedBy: text('leasedBy'),
+  leaseExpiresAt: text('leaseExpiresAt'),
+  createdAt: text('createdAt').notNull(),
+});
+
+export type RunRow = typeof runsTable.$inferSelect;
+export type VersionedOrderRow = typeof versionedOrdersTable.$inferSelect;
+export type OutboxLeaseRow = typeof outboxLeaseTable.$inferSelect;

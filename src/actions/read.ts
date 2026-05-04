@@ -119,18 +119,24 @@ export async function distinct<T = unknown>(
  * while `data` carries full-document defaults, and merging the two into
  * an ON CONFLICT target isn't always well-defined. Wrap the call in a
  * transaction to close the read-then-write race window.
+ *
+ * Returns `{ doc, created }` so callers can disambiguate the two
+ * outcomes — `created: true` when this call inserted, `created: false`
+ * when an existing row matched. The discriminator is load-bearing for
+ * race-detection in idempotency stores, lock acquisition, and
+ * "ensure-exists" flows.
  */
 export async function getOrCreate<TDoc>(
   db: SqliteDb,
   table: SQLiteTable,
   where: SQL | undefined,
   data: Partial<TDoc>,
-): Promise<TDoc> {
+): Promise<{ doc: TDoc; created: boolean }> {
   let q = db.select().from(table).$dynamic();
   if (where) q = q.where(where);
   const rows = await q.limit(1);
   const existing = rows[0];
-  if (existing) return existing as TDoc;
+  if (existing) return { doc: existing as TDoc, created: false };
   const inserted = await db
     .insert(table)
     // biome-ignore lint/suspicious/noExplicitAny: Drizzle's values() is parameterized over the inferred insert model; we accept Partial<TDoc> at the boundary.
@@ -140,5 +146,5 @@ export async function getOrCreate<TDoc>(
   if (!row) {
     throw new Error('sqlitekit/actions/getOrCreate: INSERT RETURNING yielded no row');
   }
-  return row as TDoc;
+  return { doc: row as TDoc, created: true };
 }

@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-05-04
+
+### Added — SCIM 2.0 PUT / PATCH support
+
+Surfaces requested by `@classytic/arc/scim` (arc 2.13) for IdP provisioning. See `skills/arc/references/scim.md` in the arc repo for the canonical ask.
+
+- **`SqliteRepository.replace(id, doc, options?)`** — full-document replace by primary key. Distinct from `update(id, partial)`: every column NOT present in the replacement is reset to NULL, mirroring mongo's `replaceOne` and the SCIM 2.0 PUT contract (RFC 7644 §3.5.1). PK is preserved even when the replacement carries a different `id` value. Routes through the standard plugin pipeline — multi-tenant scope, audit, cache invalidation, and `before:replace` / `after:replace` hooks all fire. New `replace` op registered in `SQLITE_OP_REGISTRY` (policyKey: 'query', mutates: true, hasIdContext: true). (`src/repository/repository.ts`, `src/operations.ts`)
+- **`actions/update.replaceById`** — the underlying primitive. UPDATE-with-explicit-NULLs (rather than DELETE+INSERT) so the row identity stays stable, `AFTER UPDATE` triggers fire, and FK side effects don't cascade. Columns marked `notNull()` without a default cannot be omitted — SQLite raises the constraint, deliberately, rather than silent column drop. (`src/actions/update.ts`)
+
+### Fixed — `bulkWrite([{ replaceOne }])` now actually replaces
+
+Previously `replaceOne` routed through `updateActions.updateById`, which only touched the columns present in the `replacement` payload. Columns omitted from the replacement kept their old values — that's `updateOne` semantics, not `replaceOne`. SCIM PUT clients sending `{ id, userName, name }` would see `externalId` / `active` / `meta` survive, violating the PUT contract.
+
+`replaceOne` now routes through `replaceById` (UPDATE-with-explicit-NULLs); `updateOne` still routes through `updateById` (partial). The two ops are now genuinely distinct. Pinned by `tests/integration/replace-and-array-ops.test.ts`. (`src/repository/repository.ts:bulkWrite`)
+
+### Fixed — `findOneAndUpdate` / `updateMany` accept raw mongo `$set` / `$unset` / `$inc` / `$setOnInsert` records
+
+Previously these methods accepted `UpdateInput = UpdateSpec | Record | Pipeline` but only the `UpdateSpec` form was actually compiled — raw mongo-operator records (`{ $set: { ... } }`) fell through to Drizzle's `set({ $set: ... })` and produced `near "where": syntax error`. SCIM PATCH in arc generates exactly this shape and forwards it to `findOneAndUpdate`, so the surface was effectively unusable for SCIM patches.
+
+Mongo-operator records now compile to flat column writes via the existing `compileUpdateSpecToSql` path (re-routed through `UpdateSpec`). Mixed `$`-prefixed + flat keys throw — same trap rule as `claim()` and `claimVersion()`. Unknown `$`-operators throw with the supported list. (`src/repository/repository.ts:#compileUpdateInput`)
+
+### Fixed — `findOneAndUpdate` / `updateMany` refuse mongo array operators cleanly
+
+`$push` / `$pull` / `$addToSet` / `$pop` / `$pullAll` previously fell through to a confusing Drizzle SQL parse error or attempted to write a column literally named `$push`. They now throw a clear, actionable error mirroring the refusal `claim()` already shipped:
+
+```
+sqlitekit: findOneAndUpdate() does not support the '$push' operator. Mongo-array
+operators do not compile to flat column writes — use a kit-native batch
+operation, compose the update with `repo.db` directly, or read-modify-write the
+JSON column at the application layer.
+```
+
+Arc's SCIM plugin translates the throw into `400 Bad Request` with `scimType: invalidValue`, the right RFC 7644 response. (`src/repository/repository.ts`)
+
+### Changed — internal consolidation (zero behavioral change)
+
+- **Aggregate normalize + keyset cursor helpers now delegate to `@classytic/repo-core/aggregate`.** `normalizeGroupBy`, `validateMeasures`, `encodeAggCursor`, `decodeAggCursor`, `isKeysetMode` were byte-identical to mongokit's copies; they now live in repo-core. Kit-local files are thin shims that bind the `'sqlitekit'` error prefix.
+- **`payloadHasTenantField` (multi-tenant plugin internal helper) now delegates to repo-core.** Sqlitekit's prior version handled only `data` / `dataArray`; the shared helper handles all 5 policy keys for parity (a no-op gain since the write-side hooks only ever receive write keys, but eliminates drift risk).
+
+### Changed — peer dep `better-sqlite3` `>=11` → `>=12`
+
+Bumped to track better-auth 1.6.x's required peer (`better-sqlite3@^12`). Hosts on better-sqlite3 v11 must upgrade alongside this release. The Drizzle driver surface used by sqlitekit is unchanged across v11 and v12; no API changes flow through.
+
+### Fixed — security & robustness hardening
+
+- **`ttlPlugin` field-name validation**: the TTL `field` option lands in trigger DDL and DELETE SQL via raw-string interpolation. Plugin construction is typically driven by trusted code, but a downstream meta-system that derived the field from environment / schema introspection would create an injection surface. Now hard-validated at construction with `^[A-Za-z_][A-Za-z0-9_]*$`. (`src/plugins/ttl/index.ts`)
+- **better-auth overlay typecheck error**: the `schemaGenerator` option (declared optional) was passed unconditionally into `createDrizzleAdapter`, which under `exactOptionalPropertyTypes: true` rejects the `| undefined` union. Now spread conditionally — `typecheck:tests` gate is finally green. (`src/better-auth/index.ts`)
+
+### ⚠️ BREAKING — `multiTenantPlugin` defaults to fail-closed (`allowDataInjection: false`)
+
+The plugin's `allowDataInjection` option used to default to `true` — meaning if
+the caller stamped the tenant onto `data` / `dataArray` themselves, the
+`requireOnWrite` throw was bypassed. That was the wrong security posture for a
+production-grade boundary: caller-supplied scope on the payload cannot be
+trusted as authentication. The default now flips to **`false`** (fail-closed).
+
+**Migration:** if you intentionally want the prior behavior — e.g. a host
+control-plane has authenticated the tenant out-of-band and stamps it onto every
+write — set the option explicitly to make the trust model visible at the call
+site:
+
+```ts
+multiTenantPlugin({ resolveTenantId: ..., allowDataInjection: true })
+```
+
+The vast majority of users use `resolveTenantId` (typically backed by an
+AsyncLocalStorage) and are unaffected. Reads are also unaffected — read-side
+tenant injection has always gone through `resolveTenantId`.
+
 ## [0.2.0] - 2026-04-22
 
 ### `SchemaGenerator<SQLiteTable>` conformance

@@ -1,136 +1,38 @@
 /**
  * Cache plugin — sqlitekit edition.
  *
- * Read-through cache keyed on `model:op:<stable-json of query/filters/id/
- * pagination>`. Runs at CACHE priority so tenant + soft-delete filters are
- * already merged into the context when the key is built — no cross-tenant
- * cache poisoning.
+ * Re-exports the unified cache plugin from `@classytic/repo-core/cache`.
+ * Sqlitekit doesn't need a kit-specific cache impl — the repo-core
+ * plugin covers CRUD + aggregate ops with TanStack-shaped per-call
+ * options (`staleTime`, `gcTime`, `swr`, `tags`, `bypass`, `enabled`,
+ * `key`) and version-bump invalidation, all on the standard
+ * `CacheAdapter` contract.
  *
- * On a hit: sets `context._cacheHit = true` + `context._cachedResult` and
- * the repository short-circuits via `RepositoryBase._cachedValue`.
- * On a miss: records the key in context so the `after:*` handler can store
- * the result.
- * On a mutation: invalidates every cached read against this model via
- * `adapter.clear('model:*')`. Adapters that can't glob fall back to TTL.
+ * Migration note (sqlitekit pre-0.3): the old local plugin took
+ * `{ ttlSeconds, cacheableOps, invalidatingOps, buildKey }`. The new
+ * plugin takes `{ enabled, invalidating, defaults, perOpDefaults,
+ * prefix, autoTagsFromScope, jitter, log }`. Map old fields like so:
+ *
+ *   - `ttlSeconds: 60`        → `defaults: { staleTime: 60 }`
+ *   - `cacheableOps: [...]`   → `enabled: [...]`
+ *   - `invalidatingOps: [...]`→ `invalidating: [...]`
+ *   - `buildKey: fn`          → not overridable; canonical key built-in.
+ *
+ * Per-call `{ skipCache: true }` becomes `{ cache: { enabled: false } }`.
  */
 
-import type { CacheAdapter } from '@classytic/repo-core/cache';
-import { stableStringify } from '@classytic/repo-core/cache';
-import { HOOK_PRIORITY } from '@classytic/repo-core/hooks';
-import type { Plugin, RepositoryBase } from '@classytic/repo-core/repository';
+export {
+  type CacheAdapter,
+  type CacheOptions,
+  cachePlugin,
+  type RepositoryCacheHandle,
+} from '@classytic/repo-core/cache';
 
-type Context = Record<string, unknown> & {
-  operation: string;
-  model: string;
-};
+import type { RepositoryCachePluginOptions } from '@classytic/repo-core/cache';
 
-export interface CachePluginOptions {
-  adapter: CacheAdapter;
-  /** TTL in seconds. Default: 60. Use 0 for no expiry (invalidation-only). */
-  ttlSeconds?: number;
-  /** Ops to cache. Default: all read ops. */
-  cacheableOps?: readonly string[];
-  /** Ops that invalidate the cache. Default: all mutating ops. */
-  invalidatingOps?: readonly string[];
-  /** Custom key builder. */
-  buildKey?: (context: Context) => string;
-}
-
-const DEFAULT_CACHEABLE: readonly string[] = [
-  'getById',
-  'getOne',
-  'getByQuery',
-  'findAll',
-  'getAll',
-  'count',
-  'exists',
-  'distinct',
-  'getOrCreate',
-];
-
-const DEFAULT_INVALIDATING: readonly string[] = [
-  'create',
-  'createMany',
-  'update',
-  'updateMany',
-  'findOneAndUpdate',
-  'upsert',
-  'delete',
-  'deleteMany',
-  'restore',
-  'increment',
-];
-
-function defaultBuildKey(context: Context): string {
-  const keyParts: Record<string, unknown> = { op: context.operation };
-  if (context['id'] !== undefined) keyParts['id'] = context['id'];
-  if (context['query'] !== undefined) keyParts['query'] = context['query'];
-  if (context['filters'] !== undefined) keyParts['filters'] = context['filters'];
-  if (context['sort'] !== undefined) keyParts['sort'] = context['sort'];
-  if (context['page'] !== undefined) keyParts['page'] = context['page'];
-  if (context['limit'] !== undefined) keyParts['limit'] = context['limit'];
-  if (context['after'] !== undefined) keyParts['after'] = context['after'];
-  return `${context.model}:${stableStringify(keyParts)}`;
-}
-
-export function cachePlugin(options: CachePluginOptions): Plugin {
-  const ttlSeconds = options.ttlSeconds ?? 60;
-  const cacheableOps = options.cacheableOps ?? DEFAULT_CACHEABLE;
-  const invalidatingOps = options.invalidatingOps ?? DEFAULT_INVALIDATING;
-  const buildKey = options.buildKey ?? defaultBuildKey;
-
-  return {
-    name: 'cache',
-    apply(repo: RepositoryBase): void {
-      for (const op of cacheableOps) {
-        repo.on(
-          `before:${op}`,
-          async (context: Context) => {
-            if (context['skipCache'] === true) return;
-            const key = buildKey(context);
-            const hit = await options.adapter.get(key);
-            if (hit !== undefined) {
-              context['_cacheHit'] = true;
-              context['_cachedResult'] = hit;
-            }
-            context['_cacheKey'] = key;
-          },
-          { priority: HOOK_PRIORITY.CACHE },
-        );
-
-        repo.on(
-          `after:${op}`,
-          async (payload: unknown) => {
-            const { context, result } = payload as { context: Context; result: unknown };
-            if (context['_cacheHit'] === true) return;
-            const key = context['_cacheKey'] as string | undefined;
-            if (!key) return;
-            await options.adapter.set(key, result, ttlSeconds);
-          },
-          { priority: HOOK_PRIORITY.CACHE },
-        );
-      }
-
-      for (const op of invalidatingOps) {
-        repo.on(
-          `after:${op}`,
-          async (payload: unknown) => {
-            const { context } = payload as { context: Context };
-            if (options.adapter.clear) {
-              await options.adapter.clear(`${context.model}:*`);
-            }
-          },
-          { priority: HOOK_PRIORITY.CACHE },
-        );
-      }
-    },
-  };
-}
-
-// Type re-export only. The `CacheAdapter` contract is part of sqlitekit's
-// public surface (callers pass an instance into `cachePlugin({ adapter })`),
-// so surfacing the type here lets app code stay in one namespace. The
-// concrete `createMemoryCacheAdapter` is NOT re-exported — callers who
-// want it import it from `@classytic/repo-core/cache` directly. That
-// keeps this file a pure plugin composition, not a namespace shadow.
-export type { CacheAdapter } from '@classytic/repo-core/cache';
+/**
+ * Local alias for the repo-core plugin options. Hosts importing
+ * `CachePluginOptions` from `@classytic/sqlitekit/plugins/cache` get
+ * the canonical shape without coupling to repo-core's internal name.
+ */
+export type CachePluginOptions = RepositoryCachePluginOptions;

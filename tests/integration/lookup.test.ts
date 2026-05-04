@@ -164,7 +164,7 @@ describe('lookupPopulate — one-to-one (single: true)', () => {
 
     expect(result.method).toBe('offset');
     expect(result.total).toBe(5);
-    const alice = result.docs.find((d) => d.id === 'e1');
+    const alice = result.data.find((d) => d.id === 'e1');
     expect(alice?.department).toMatchObject({
       id: 'd_eng',
       name: 'Engineering',
@@ -185,8 +185,8 @@ describe('lookupPopulate — one-to-one (single: true)', () => {
         },
       ],
     });
-    expect(result.docs).toHaveLength(1);
-    expect(result.docs[0]?.department).toBeNull();
+    expect(result.data).toHaveLength(1);
+    expect(result.data[0]?.department).toBeNull();
   });
 
   it('respects foreign-side `where` (only joins active departments)', async () => {
@@ -208,7 +208,7 @@ describe('lookupPopulate — one-to-one (single: true)', () => {
         },
       ],
     });
-    expect(result.docs[0]?.department).toBeNull();
+    expect(result.data[0]?.department).toBeNull();
   });
 
   it('projects only the selected fields', async () => {
@@ -225,7 +225,7 @@ describe('lookupPopulate — one-to-one (single: true)', () => {
         },
       ],
     });
-    const dept = result.docs[0]?.department as Record<string, unknown> | null;
+    const dept = result.data[0]?.department as Record<string, unknown> | null;
     expect(dept).toEqual({ name: 'Engineering', code: 'ENG' });
     expect(dept).not.toHaveProperty('id');
     expect(dept).not.toHaveProperty('active');
@@ -245,7 +245,7 @@ describe('lookupPopulate — one-to-one (single: true)', () => {
         },
       ],
     });
-    expect(result.docs[0]?.department).toEqual({ name: 'Engineering' });
+    expect(result.data[0]?.department).toEqual({ name: 'Engineering' });
   });
 });
 
@@ -273,7 +273,7 @@ describe('lookupPopulate — one-to-many (default)', () => {
         },
       ],
     });
-    const alice = result.docs[0];
+    const alice = result.data[0];
     expect(alice?.tasks).toHaveLength(3);
     expect(alice?.tasks?.map((t) => t.id).sort()).toEqual(['t1', 't2', 't3']);
   });
@@ -290,7 +290,7 @@ describe('lookupPopulate — one-to-many (default)', () => {
         },
       ],
     });
-    expect(result.docs[0]?.tasks).toEqual([]);
+    expect(result.data[0]?.tasks).toEqual([]);
   });
 
   it('filters foreign rows via `where` (only open tasks)', async () => {
@@ -307,7 +307,7 @@ describe('lookupPopulate — one-to-many (default)', () => {
         },
       ],
     });
-    const tasks = result.docs[0]?.openTasks as { id: string; title: string }[] | undefined;
+    const tasks = result.data[0]?.openTasks as { id: string; title: string }[] | undefined;
     expect(tasks).toHaveLength(2);
     expect(tasks?.every((t) => ['t1', 't2'].includes(t.id))).toBe(true);
   });
@@ -345,7 +345,7 @@ describe('lookupPopulate — multi-lookup composition', () => {
         },
       ],
     });
-    const alice = result.docs[0];
+    const alice = result.data[0];
     expect(alice?.department).toEqual({ name: 'Engineering' });
     expect(alice?.tasks).toHaveLength(3);
   });
@@ -367,7 +367,7 @@ describe('lookupPopulate — multi-lookup composition', () => {
       limit: 10,
     });
     expect(result.total).toBe(5);
-    expect(result.docs).toHaveLength(5);
+    expect(result.data).toHaveLength(5);
   });
 
   it('rejects duplicate output keys at validation time', async () => {
@@ -434,7 +434,7 @@ describe('lookupPopulate — base-table filter / sort / select', () => {
       sort: { createdAt: -1 },
       limit: 10,
     });
-    const ids = result.docs.map((d) => d.id);
+    const ids = result.data.map((d) => d.id);
     expect(ids).toEqual(['e5', 'e4', 'e3', 'e2', 'e1']);
   });
 
@@ -453,7 +453,7 @@ describe('lookupPopulate — base-table filter / sort / select', () => {
         },
       ],
     });
-    const row = result.docs[0]!;
+    const row = result.data[0]!;
     expect(row.id).toBe('e1');
     expect(row.name).toBe('Alice');
     expect(row).not.toHaveProperty('email');
@@ -497,7 +497,7 @@ describe('lookupPopulate — pagination', () => {
       hasNext: true,
       hasPrev: false,
     });
-    expect(result.docs.map((d) => d.id)).toEqual(['e1', 'e2']);
+    expect(result.data.map((d) => d.id)).toEqual(['e1', 'e2']);
   });
 
   it('follows-on page yields the next slice', async () => {
@@ -515,7 +515,7 @@ describe('lookupPopulate — pagination', () => {
       page: 2,
       limit: 2,
     });
-    expect(result.docs.map((d) => d.id)).toEqual(['e3', 'e4']);
+    expect(result.data.map((d) => d.id)).toEqual(['e3', 'e4']);
     expect(result.hasNext).toBe(true);
     expect(result.hasPrev).toBe(true);
   });
@@ -539,7 +539,7 @@ describe('lookupPopulate — pagination', () => {
     expect(result.total).toBe(0);
     expect(result.pages).toBe(0);
     expect(result.hasNext).toBe(true);
-    expect(result.docs).toHaveLength(2);
+    expect(result.data).toHaveLength(2);
   });
 });
 

@@ -46,13 +46,36 @@ import {
 import type { SQLiteTable } from 'drizzle-orm/sqlite-core';
 
 /**
+ * Custom column resolver. When provided, this overrides the default
+ * "look up `field` on `table`" behavior — used by the aggregate
+ * compiler to support dotted-alias paths (`'department.active'`)
+ * referencing columns on joined alias tables.
+ *
+ * Resolvers throw when a field isn't found, with a kit-friendly error
+ * message naming the field and (where possible) the surrounding scope.
+ */
+export type ColumnResolver = (field: string) => AnyColumn;
+
+/**
  * Compile a Filter IR node to a Drizzle SQL predicate against the
  * given table. Returns `undefined` when the node is the tautology
  * (`TRUE`) or when an `and` collapses to no children — the caller
  * treats `undefined` as "no WHERE", letting Drizzle generate the
  * efficient unbounded query.
+ *
+ * @param filter   Filter IR root
+ * @param table    Default table for column lookups
+ * @param resolver Optional override — when set, all field references
+ *                 route through it instead of the default `table[field]`
+ *                 lookup. Used by the aggregate compiler to support
+ *                 dotted-alias paths (joined-table fields).
  */
-export function compileFilterToDrizzle(filter: Filter, table: SQLiteTable): SQL | undefined {
+export function compileFilterToDrizzle(
+  filter: Filter,
+  table: SQLiteTable,
+  resolver?: ColumnResolver,
+): SQL | undefined {
+  const lookup: ColumnResolver = resolver ?? ((field: string) => column(table, field));
   switch (filter.op) {
     case 'true':
       return undefined;
@@ -60,42 +83,40 @@ export function compileFilterToDrizzle(filter: Filter, table: SQLiteTable): SQL 
       return sql`1 = 0`;
 
     case 'eq': {
-      const col = column(table, filter.field);
+      const col = lookup(filter.field);
       return filter.value === null ? isNull(col) : eq(col, filter.value);
     }
     case 'ne': {
-      const col = column(table, filter.field);
+      const col = lookup(filter.field);
       return filter.value === null ? isNotNull(col) : ne(col, filter.value);
     }
     case 'gt':
-      return gt(column(table, filter.field), filter.value);
+      return gt(lookup(filter.field), filter.value);
     case 'gte':
-      return gte(column(table, filter.field), filter.value);
+      return gte(lookup(filter.field), filter.value);
     case 'lt':
-      return lt(column(table, filter.field), filter.value);
+      return lt(lookup(filter.field), filter.value);
     case 'lte':
-      return lte(column(table, filter.field), filter.value);
+      return lte(lookup(filter.field), filter.value);
 
     case 'in': {
       // Empty IN-set matches nothing — return contradiction so callers
       // don't accidentally widen the result by dropping the predicate.
       if (filter.values.length === 0) return sql`1 = 0`;
-      return inArray(column(table, filter.field), [...filter.values]);
+      return inArray(lookup(filter.field), [...filter.values]);
     }
     case 'nin': {
       // Empty NOT-IN matches everything — `undefined` lets the caller
       // omit the WHERE rather than emit `1 = 1`.
       if (filter.values.length === 0) return undefined;
-      return notInArray(column(table, filter.field), [...filter.values]);
+      return notInArray(lookup(filter.field), [...filter.values]);
     }
 
     case 'exists':
-      return filter.exists
-        ? isNotNull(column(table, filter.field))
-        : isNull(column(table, filter.field));
+      return filter.exists ? isNotNull(lookup(filter.field)) : isNull(lookup(filter.field));
 
     case 'like': {
-      const col = column(table, filter.field);
+      const col = lookup(filter.field);
       // SQLite LIKE treats `%` and `_` as wildcards. Callers pass
       // `\\%` / `\\_` (literal backslash + meta) when they want the
       // metachars matched as literals — SQLite's `ESCAPE '\'` clause
@@ -124,7 +145,7 @@ export function compileFilterToDrizzle(filter: Filter, table: SQLiteTable): SQL 
     case 'and': {
       if (filter.children.length === 0) return undefined;
       const parts = filter.children
-        .map((c) => compileFilterToDrizzle(c, table))
+        .map((c) => compileFilterToDrizzle(c, table, resolver))
         .filter((x): x is SQL => x !== undefined);
       if (parts.length === 0) return undefined;
       if (parts.length === 1) return parts[0];
@@ -133,14 +154,14 @@ export function compileFilterToDrizzle(filter: Filter, table: SQLiteTable): SQL 
     case 'or': {
       if (filter.children.length === 0) return sql`1 = 0`;
       // For OR, an `undefined` child (TRUE) collapses the whole OR to TRUE.
-      const compiled = filter.children.map((c) => compileFilterToDrizzle(c, table));
+      const compiled = filter.children.map((c) => compileFilterToDrizzle(c, table, resolver));
       if (compiled.some((x) => x === undefined)) return undefined;
       const parts = compiled as SQL[];
       if (parts.length === 1) return parts[0];
       return or(...parts);
     }
     case 'not': {
-      const inner = compileFilterToDrizzle(filter.child, table);
+      const inner = compileFilterToDrizzle(filter.child, table, resolver);
       // NOT TRUE = FALSE.
       return inner === undefined ? sql`1 = 0` : not(inner);
     }

@@ -9,6 +9,7 @@
 
 import { buildTenantScope } from '@classytic/repo-core/filter';
 import { HOOK_PRIORITY } from '@classytic/repo-core/hooks';
+import { payloadHasTenantField } from '@classytic/repo-core/plugins';
 import type { Plugin, RepositoryBase } from '@classytic/repo-core/repository';
 import type { TenantConfig } from '@classytic/repo-core/tenant';
 
@@ -51,18 +52,27 @@ export interface MultiTenantOptions extends Pick<TenantConfig, 'tenantField'> {
    */
   skipWhen?: (context: Context, operation: string) => boolean;
   /**
-   * When `true` (default), bypass the `requireOnWrite` throw if the write
-   * payload already carries the tenant field. This lets hosts that stamp
-   * the tenant into `data` / `dataArray` themselves use the plugin without
+   * When `true`, bypass the `requireOnWrite` throw if the write payload
+   * already carries the tenant field. This lets hosts that stamp the
+   * tenant into `data` / `dataArray` themselves use the plugin without
    * having to hand-roll a workaround.
    *
-   * Set to `false` to restore the strict pre-fix behavior: `resolveTenantId`
-   * MUST return a value on writes, otherwise the plugin throws.
+   * **Default: `false` (secure / fail-closed).** `resolveTenantId` MUST
+   * return a value on writes, otherwise the plugin throws. This is the
+   * right posture for a security-sensitive boundary — caller-stamped
+   * tenant on the payload cannot be trusted as authentication. Set this
+   * to `true` explicitly only when the host control-plane has already
+   * authenticated the tenant out-of-band and stamps it onto every
+   * write, making the trust model visible at the call site.
    *
-   * Safety: when the payload already carries the tenant, the plugin skips
-   * its own stamping (it does not overwrite). Tenant isolation on reads is
-   * unaffected — reads always go through `resolveTenantId` and flat filter
-   * injection.
+   * **Migration from < 0.4:** prior default was `true`. To preserve the
+   * old behavior verbatim, set `allowDataInjection: true`. To get the
+   * new secure default, leave it unset.
+   *
+   * Safety: when the payload already carries the tenant AND this is
+   * `true`, the plugin skips its own stamping (it does not overwrite).
+   * Tenant isolation on reads is unaffected — reads always go through
+   * `resolveTenantId` and flat filter injection.
    */
   allowDataInjection?: boolean;
 }
@@ -82,30 +92,32 @@ const QUERY_OPS = [
   'restore',
   'updateMany',
   'deleteMany',
+  // Field-grade/read primitives with `context.query` policy scope.
+  // `claim` / `claimVersion` build CAS filters, `cursor` accepts a
+  // positional filter, and `aggregate` merges policy scope into its
+  // pre-aggregate filter.
+  'claim',
+  'claimVersion',
+  'cursor',
+  'aggregate',
 ] as const;
 
-const LIST_OPS = ['getAll'] as const;
+const LIST_OPS = ['getAll', 'aggregatePaginate', 'lookupPopulate'] as const;
 const WRITE_OPS = ['create', 'createMany', 'upsert'] as const;
 
 /**
  * True when the write payload already has `tenantField` set by the
- * caller. Used to decide whether we can safely skip the requireOnWrite
- * throw rather than rejecting a payload that is, in fact, already
- * tenant-scoped.
- *
- * - `data` present → `context.data[tenantField]` must be set
- * - `dataArray` present → EVERY row must have `tenantField` set (partial
- *   stamping is ambiguous — we have no resolver value to fill in the
- *   gaps — so we treat it as "not stamped" and let the throw fire)
- * - neither present → no payload to trust; return false
+ * caller. Delegates to repo-core's canonical `payloadHasTenantField`
+ * — keeps the policy decision identical across every kit. Sqlitekit
+ * only ever calls this with `data` / `dataArray` (the write-side
+ * policy keys), but the shared helper handles all 5 keys for parity.
  */
 function writePayloadHasTenantField(context: Context, tenantField: string): boolean {
-  if (context.data && typeof context.data === 'object') {
-    return context.data[tenantField] != null;
+  if (context.data) {
+    return payloadHasTenantField(context, 'data', tenantField);
   }
   if (Array.isArray(context.dataArray)) {
-    if (context.dataArray.length === 0) return false;
-    return context.dataArray.every((row) => row && row[tenantField] != null);
+    return payloadHasTenantField(context, 'dataArray', tenantField);
   }
   return false;
 }
@@ -113,7 +125,7 @@ function writePayloadHasTenantField(context: Context, tenantField: string): bool
 export function multiTenantPlugin(options: MultiTenantOptions): Plugin {
   const tenantField = options.tenantField ?? 'organizationId';
   const requireOnWrite = options.requireOnWrite ?? true;
-  const allowDataInjection = options.allowDataInjection ?? true;
+  const allowDataInjection = options.allowDataInjection ?? false;
   const { skipWhen } = options;
 
   const inject = (context: Context, key: 'query' | 'filters', op: string): void => {
