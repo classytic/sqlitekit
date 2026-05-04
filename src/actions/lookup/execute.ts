@@ -98,12 +98,12 @@ export async function executeLookup<
     hasNext = page * limit < total;
   }
 
-  const docs = hydrateLookupRows<TDoc & TExtra>(dataRows, lookups);
+  const data = hydrateLookupRows<TDoc & TExtra>(dataRows, lookups);
   const pages = countStrategy === 'none' ? 0 : Math.max(1, Math.ceil(total / limit));
 
   return {
     method: 'offset',
-    docs,
+    data,
     page,
     limit,
     total,

@@ -35,4 +35,5 @@
  */
 
 export { countAggGroups } from './count.js';
-export { executeAgg } from './execute.js';
+export { type ExecuteAggOptions, executeAgg } from './execute.js';
+export { decodeAggCursor, encodeAggCursor, isKeysetMode } from './keyset.js';

@@ -136,6 +136,50 @@ export default {
 | `@classytic/sqlitekit/plugins/audit` | `auditPlugin`, `AuditEntry` |
 | `@classytic/sqlitekit/plugins/cache` | `cachePlugin`, `createMemoryCacheAdapter` |
 | `@classytic/sqlitekit/plugins/ttl` | `ttlPlugin`, `createTtlPartialIndex`, `dropTtlPartialIndex` |
+| `@classytic/sqlitekit/better-auth` | `createBetterAuthOverlay` — BA × Drizzle adapter for BA-managed sqlite tables (see below) |
+
+## Better Auth bridge — `@classytic/sqlitekit/better-auth`
+
+When [Better Auth](https://better-auth.com) writes to your sqlite via Kysely, sqlitekit ships a kit-owned bridge that exposes BA's tables as `DataAdapter<TDoc>` instances ready for arc / any host:
+
+```ts
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { betterAuth } from 'better-auth';
+import { organization } from 'better-auth/plugins';
+import { createBetterAuthOverlay } from '@classytic/sqlitekit/better-auth';
+
+const sqlite = new Database('app.db');
+const auth = betterAuth({ database: sqlite, plugins: [organization()] });
+const db = drizzle(sqlite);
+
+// Async — we read BA's resolved schema (auth.$context.tables) at boot.
+// Picks up additionalFields, modelName overrides, plugin schemas automatically.
+const orgAdapter = await createBetterAuthOverlay({
+  auth,
+  db,
+  collection: 'organization',
+});
+
+defineResource({ name: 'organization', adapter: orgAdapter, idField: 'id' });
+```
+
+**Column conversion** — BA field types map to Drizzle columns (`string` → text, `date`/`number`/`boolean` → integer, all wire-format-stable with BA's writes). Hosts wanting typed `Date` / array values handle conversion downstream or wrap with a Repository hook.
+
+**Need a column BA doesn't declare?** Pass `additionalColumns`:
+
+```ts
+import { integer } from 'drizzle-orm/sqlite-core';
+
+const orgAdapter = await createBetterAuthOverlay({
+  auth, db, collection: 'organization',
+  additionalColumns: { syncedAt: integer('syncedAt') },
+});
+```
+
+**Need full control** (custom Drizzle column modes for typed Date, custom `SqliteRepository` subclass with domain methods)? Drop the factory, hand-roll the table + repo + `createDrizzleAdapter` directly. Same `DataAdapter<TDoc>` contract — host code is unchanged.
+
+`better-auth` is an **optional peer dependency** — only required when you import this subpath.
 
 ## The `MinimalRepo` contract
 

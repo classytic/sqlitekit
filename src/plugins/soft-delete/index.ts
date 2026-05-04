@@ -45,6 +45,14 @@ const DEFAULT_READS: readonly string[] = [
   'exists',
   'distinct',
   'getAll',
+  'aggregate',
+  'aggregatePaginate',
+  'lookupPopulate',
+  // Streaming reads — `cursor` accepts a filter and exposes it as
+  // `context.query`, so soft-delete must inject the tombstone filter
+  // here too. Without this, migrations that iterate via `cursor` see
+  // soft-deleted rows.
+  'cursor',
 ];
 
 export function softDeletePlugin(options: SoftDeleteOptions = {}): Plugin {
@@ -74,7 +82,10 @@ export function softDeletePlugin(options: SoftDeleteOptions = {}): Plugin {
     name: 'soft-delete',
     apply(repo: RepositoryBase): void {
       for (const op of filterReads) {
-        const key: 'query' | 'filters' = op === 'getAll' ? 'filters' : 'query';
+        const key: 'query' | 'filters' =
+          op === 'getAll' || op === 'aggregatePaginate' || op === 'lookupPopulate'
+            ? 'filters'
+            : 'query';
         repo.on(`before:${op}`, (context: Context) => injectFilter(context, key), {
           priority: HOOK_PRIORITY.POLICY,
         });

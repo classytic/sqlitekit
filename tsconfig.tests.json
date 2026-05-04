@@ -1,0 +1,28 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "//": [
+    "Conformance gate. Wired into prepublishOnly via `npm run typecheck:tests`.",
+    "Mirrors mongokit/tsconfig.tests.json — keep them symmetric.",
+    "",
+    "Covers the public-surface boundary:",
+    "  - src/**     so kit code typechecks against the contract",
+    "  - tests/unit/standard-repo-assignment.test-d.ts is the per-method",
+    "               StandardRepo assignability lock-in. src/repository/",
+    "               contract.ts already pins the whole-class shape; this",
+    "               test adds Partial<StandardRepo> bindings that engage",
+    "               strictFunctionTypes contravariance (the arc boundary).",
+    "",
+    "Not in scope: the rest of tests/** is checked by the regular",
+    "`tsc -p tsconfig.test.json` typecheck. Adding a new public-API",
+    "integration test? Add it here too if it imports sqlitekit through",
+    "the published surface, so its imports stay locked."
+  ],
+  "include": ["src/**/*", "tests/unit/standard-repo-assignment.test-d.ts"],
+  "exclude": ["node_modules", "dist"]
+}

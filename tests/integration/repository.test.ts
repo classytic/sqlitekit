@@ -70,14 +70,14 @@ describe('SqliteRepository — MinimalRepo conformance', () => {
     expect(result).toBeNull();
   });
 
-  it('delete returns success:false for missing id, success:true when removed', async () => {
+  it('delete returns null for missing id, DeleteResult when removed', async () => {
     const created = await repo.create(makeUser());
     const first = await repo.delete(created.id);
-    expect(first.success).toBe(true);
-    expect(first.id).toBe(created.id);
+    expect(first).not.toBeNull();
+    expect(first?.id).toBe(created.id);
 
     const second = await repo.delete(created.id);
-    expect(second.success).toBe(false);
+    expect(second).toBeNull();
   });
 
   it('getAll paginates with offset semantics and returns arc-shaped envelope', async () => {
@@ -94,7 +94,7 @@ describe('SqliteRepository — MinimalRepo conformance', () => {
       hasPrev: boolean;
     };
     expect(page1.method).toBe('offset');
-    expect(page1.docs).toHaveLength(3);
+    expect(page1.data).toHaveLength(3);
     expect(page1.total).toBe(7);
     expect(page1.pages).toBe(3);
     expect(page1.hasNext).toBe(true);

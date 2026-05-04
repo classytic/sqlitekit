@@ -13,6 +13,7 @@
  * the SqliteRepository.
  */
 
+import { cachePlugin, createMemoryCacheAdapter } from '@classytic/repo-core/cache';
 import {
   type ConformanceDoc,
   type ConformanceHarness,
@@ -41,6 +42,28 @@ const harness: ConformanceHarness<ConformanceDoc> = {
     duplicateKeyError: true,
     distinct: true,
     aggregate: true,
+    aggregateOps: {
+      // SQLite has no native `percentile_cont` / `percentile_disc`.
+      // Sqlitekit throws `'percentile' op is not supported on SQLite`
+      // — hosts that need percentile dashboards target mongokit (or
+      // future pgkit). Conformance scenario gates on this flag.
+      percentile: false,
+      // SQLite has no native STDDEV; computational formula is
+      // numerically unstable. Same asymmetric pattern as percentile.
+      stddev: false,
+      // SQLite ≥3.25 supports `RANK() OVER`; sqlitekit currently uses
+      // an in-memory post-processor at the JS level (see
+      // `actions/aggregate/topN.ts`). Result shape is identical to
+      // mongokit's window-function output.
+      topN: true,
+      // `unixepoch` floor-div arithmetic handles `{ every, unit }` bins.
+      customDateBuckets: true,
+      // SQLite's `strftime` supports `%H:%M` / `%H:00` natively.
+      dateBucketSubMinute: true,
+      // Per-request `cache?` slot routes through repo-core's unified
+      // `cachePlugin({ adapter })` when wired in the `plugins` array.
+      cache: true,
+    },
     getOrCreate: true,
     countAndExists: true,
   },
@@ -50,8 +73,17 @@ const harness: ConformanceHarness<ConformanceDoc> = {
       db: db.db,
       table: conformanceTable,
     });
+    // Cache scenarios use a separate repo instance with the unified
+    // `cachePlugin({ adapter })` wired — hermetic per setup().
+    const cachedRepo = new SqliteRepository<ConformanceDoc>({
+      db: db.db,
+      table: conformanceTable,
+      plugins: [cachePlugin({ adapter: createMemoryCacheAdapter() })],
+    });
     return {
       repo,
+      cachedRepo:
+        cachedRepo as unknown as import('@classytic/repo-core/testing').ConformanceContext<ConformanceDoc>['cachedRepo'],
       cleanup: async () => {
         db.close();
       },

@@ -35,7 +35,7 @@ export interface SortKey {
 /** Result envelope for offset pagination — page number + total. */
 export interface OffsetPage<TDoc> {
   method: 'offset';
-  docs: TDoc[];
+  data: TDoc[];
   page: number;
   limit: number;
   total: number;
@@ -47,7 +47,7 @@ export interface OffsetPage<TDoc> {
 /** Result envelope for keyset pagination — opaque next cursor + hasMore. */
 export interface KeysetPage<TDoc> {
   method: 'keyset';
-  docs: TDoc[];
+  data: TDoc[];
   limit: number;
   hasMore: boolean;
   next: string | null;
@@ -93,16 +93,16 @@ export class PaginationEngine {
       // LIMIT+1 peek to detect hasNext without a count.
       let dataQ = this.db.select().from(this.table).$dynamic();
       if (opts.where) dataQ = dataQ.where(opts.where);
-      const docs = (await dataQ
+      const data = (await dataQ
         .orderBy(...orderBy)
         .limit(opts.limit + 1)
         .offset(offset)) as TDoc[];
 
-      const hasNext = docs.length > opts.limit;
-      if (hasNext) docs.pop();
+      const hasNext = data.length > opts.limit;
+      if (hasNext) data.pop();
       return {
         method: 'offset',
-        docs,
+        data,
         page: opts.page,
         limit: opts.limit,
         total: 0,
@@ -118,7 +118,7 @@ export class PaginationEngine {
     let countQ = this.db.select({ n: sql<number>`count(*)` }).from(this.table).$dynamic();
     if (opts.where) countQ = countQ.where(opts.where);
 
-    const [docs, countRows] = await Promise.all([
+    const [data, countRows] = await Promise.all([
       dataQ
         .orderBy(...orderBy)
         .limit(opts.limit)
@@ -130,7 +130,7 @@ export class PaginationEngine {
     const pages = total === 0 ? 0 : Math.ceil(total / opts.limit);
     return {
       method: 'offset',
-      docs: docs as TDoc[],
+      data: data as TDoc[],
       page: opts.page,
       limit: opts.limit,
       total,
@@ -173,7 +173,7 @@ export class PaginationEngine {
 
     return {
       method: 'keyset',
-      docs: rows,
+      data: rows,
       limit: opts.limit,
       hasMore,
       next,

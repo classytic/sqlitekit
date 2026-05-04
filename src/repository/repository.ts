@@ -26,6 +26,7 @@
  * even though their query backends differ.
  */
 
+import type { RepositoryCacheHandle } from '@classytic/repo-core/cache';
 import type { RepositoryContext } from '@classytic/repo-core/context';
 import type { Filter } from '@classytic/repo-core/filter';
 import { isFilter, TRUE } from '@classytic/repo-core/filter';
@@ -38,6 +39,7 @@ import type {
   BulkWriteResult,
   DeleteOptions,
   DeleteResult,
+  KeysetAggPaginationResult,
   LookupPopulateOptions,
   LookupPopulateResult,
   MinimalRepo,
@@ -52,9 +54,15 @@ import {
   isUpdateSpec,
   type UpdateInput,
 } from '@classytic/repo-core/update';
-import { asc, desc, getTableColumns, getTableName, sql } from 'drizzle-orm';
+import { asc, desc, and as drizzleAnd, getTableColumns, getTableName, sql } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
-import { countAggGroups, executeAgg } from '../actions/aggregate/index.js';
+import {
+  countAggGroups,
+  decodeAggCursor,
+  encodeAggCursor,
+  executeAgg,
+  isKeysetMode,
+} from '../actions/aggregate/index.js';
 import * as createActions from '../actions/create.js';
 import * as deleteActions from '../actions/delete.js';
 import { type ExplainRow, explain as explainAction } from '../actions/explain.js';
@@ -64,9 +72,74 @@ import * as readActions from '../actions/read.js';
 import * as updateActions from '../actions/update.js';
 import { type BatchItem, type RepoBatchBuilder, withBatch } from '../batch/batch.js';
 import { compileFilterToDrizzle } from '../filter/compile.js';
+import { recordToFilter } from '../filter/from-record.js';
 import { PaginationEngine, type SortKey } from './pagination/PaginationEngine.js';
 import { withManualTransaction } from './transaction.js';
 import type { SqliteDb } from './types.js';
+
+/**
+ * Mongo array operators that don't compile to flat SQLite column writes.
+ * `$push` / `$pull` / `$addToSet` / `$pop` / `$pullAll` are array-aware
+ * mutations on the mongo BSON model; SQLite stores arrays as JSON in TEXT
+ * columns and would need `json_insert` / `json_remove` to express the
+ * same semantic atomically (kit-specific work the IR doesn't yet ship).
+ *
+ * Hosts hitting this — typically through SCIM PATCH array ops in
+ * `@classytic/arc/scim` — get a clean error instead of an incoherent
+ * Drizzle failure or a row write to a column literally named `$push`.
+ * The SCIM plugin translates the throw into a `400 Bad Request` with
+ * `scimType: invalidValue`, which is the right RFC 7644 response.
+ *
+ * Mirrors the refusal `claim()` ships at the same surface — same op
+ * list, same error shape. Centralised here so future ops added to the
+ * unsupported list propagate to every write surface at once.
+ */
+const UNSUPPORTED_MONGO_ARRAY_OPS = ['$push', '$pull', '$addToSet', '$pop', '$pullAll'] as const;
+
+/**
+ * Mongo write operators we DO compile to flat SQLite column writes.
+ * `$set` / `$unset` / `$inc` map cleanly to UPDATE column assignments;
+ * `$setOnInsert` is a no-op on a non-upsert path and ignored on the
+ * UPDATE branch (it lands in the INSERT branch via `UpdateSpec`).
+ *
+ * SCIM PATCH in `@classytic/arc/scim` produces these operator records
+ * directly (`{ $set: { active: false } }`) and forwards to
+ * `findOneAndUpdate`. Without this compilation step the keys land as
+ * literal column names and Drizzle errors with an unhelpful SQL parse
+ * error — same shape as the array-op gap, different cause.
+ */
+const SUPPORTED_MONGO_WRITE_OPS = ['$set', '$unset', '$inc', '$setOnInsert'] as const;
+
+function rejectMongoArrayOperators(update: unknown, callerName: string): void {
+  if (!update || typeof update !== 'object' || Array.isArray(update)) return;
+  const record = update as Record<string, unknown>;
+  for (const op of UNSUPPORTED_MONGO_ARRAY_OPS) {
+    if (op in record) {
+      throw new Error(
+        `sqlitekit: ${callerName}() does not support the '${op}' operator. ` +
+          'Mongo-array operators do not compile to flat column writes — ' +
+          'use a kit-native batch operation, compose the update with `repo.db` directly, ' +
+          'or read-modify-write the JSON column at the application layer.',
+      );
+    }
+  }
+}
+
+/**
+ * Detect a mongo-operator record (any top-level key starts with `$`).
+ * Used by `findOneAndUpdate` / `updateMany` to decide whether to
+ * compile the raw record into a flat column write or pass it through
+ * as-is (already-flat record).
+ *
+ * **Mixed records throw.** A patch with both `$`-prefixed keys AND
+ * raw column keys is almost always a wiring bug — mongo silently drops
+ * the flat keys. Same trap rule as `claim()` and `claimVersion()`.
+ */
+function isMongoOperatorRecord(update: unknown): boolean {
+  if (!update || typeof update !== 'object' || Array.isArray(update)) return false;
+  const keys = Object.keys(update as Record<string, unknown>);
+  return keys.some((k) => k.startsWith('$'));
+}
 
 /** Construction options for the Drizzle-backed `SqliteRepository`. */
 export interface SqliteRepositoryOptions extends Omit<RepositoryBaseOptions, 'name'> {
@@ -105,6 +178,49 @@ export interface SqliteQueryOptions extends QueryOptions {
 }
 
 /**
+ * Narrow view of the repo exposed to wrap-style middleware. Mirrors
+ * mongokit's `MinimalRepoView` — middleware shouldn't reach into the
+ * full repository (that would couple every middleware to the kit).
+ */
+export interface SqliteMinimalRepoView<TDoc> {
+  readonly modelName: string;
+  readonly idField: string;
+  getById(id: string, options?: QueryOptions): Promise<TDoc | null>;
+  create(data: Partial<TDoc>, options?: WriteOptions): Promise<TDoc>;
+  update(id: string, data: Partial<TDoc>, options?: WriteOptions): Promise<TDoc | null>;
+  delete(id: string, options?: DeleteOptions): Promise<DeleteResult | null>;
+}
+
+/**
+ * Wrap-style middleware context. The `next()` continuation drives the
+ * inner middleware (or, for the innermost middleware, the actual op +
+ * after/error hooks). Mutate `context.data` / `context.query` BEFORE
+ * `next()` for input transforms, transform the resolved value AFTER
+ * `next()` for output transforms.
+ */
+export interface SqliteMiddlewareContext<TDoc> {
+  readonly operation: string;
+  readonly context: RepositoryContext;
+  next: () => Promise<unknown>;
+  readonly repo: SqliteMinimalRepoView<TDoc>;
+}
+
+/**
+ * Wrap-style middleware — Prisma `$extends.query` / Express middleware
+ * shape. Registered via `repo.useMiddleware(mw)`. Composes around every
+ * `_runOp` invocation (and cache-hit branches) in registration order
+ * (first-registered runs outermost).
+ *
+ * Middleware composes WITH plugins, not instead of them: hooks
+ * (`before:*`, `after:*`, `error:*`) still fire from inside `next()`,
+ * so the policy phase (multi-tenant scope, soft-delete filter, audit)
+ * stays authoritative even when middleware short-circuits.
+ */
+export type SqliteMiddleware<TDoc = unknown> = (
+  ctx: SqliteMiddlewareContext<TDoc>,
+) => Promise<unknown>;
+
+/**
  * Repository class. Implements `MinimalRepo<TDoc>` from repo-core so
  * arc accepts it without a cast, plus the standard extensions
  * (findOneAndUpdate, updateMany, deleteMany, upsert, increment,
@@ -127,6 +243,14 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
    * resolve via the db, but throw a clear error otherwise.
    */
   readonly schema: Record<string, SQLiteTable> | undefined;
+
+  /**
+   * Cache handle wired by the unified `cachePlugin` from
+   * `@classytic/repo-core/cache`. `undefined` until/unless the host
+   * registers `cachePlugin({ adapter })` in the `plugins` array. Read
+   * by `invalidateAggregateCache()` to forward tag invalidation.
+   */
+  cache?: RepositoryCacheHandle;
 
   constructor(options: SqliteRepositoryOptions) {
     const { plugins, hooks, pluginOrderChecks, name, table, db, idField, schema } = options;
@@ -181,10 +305,83 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
   // MinimalRepo surface
   // ────────────────────────────────────────────────────────────────────
 
+  /** Wrap-style middleware stack — outermost first, populated by `useMiddleware()`. */
+  private _middlewares: SqliteMiddleware<TDoc>[] = [];
+
+  /**
+   * Register a wrap-style middleware (Prisma `$extends.query` shape).
+   * Composes around every `_runOp` invocation AND every cache-hit
+   * branch — middleware sees cached reads identically to driver-backed
+   * ones, so timing / audit / transformer middleware never has a
+   * silent gap.
+   *
+   * Registration order = composition order: the first middleware
+   * registered runs outermost (wraps everything else). Mirrors
+   * mongokit's `useMiddleware()` exactly so cross-kit code lifts.
+   *
+   * @example Time every op
+   * ```ts
+   * repo.useMiddleware(async ({ operation, next }) => {
+   *   const start = performance.now();
+   *   try { return await next(); }
+   *   finally { metrics.record(operation, performance.now() - start); }
+   * });
+   * ```
+   *
+   * @example Short-circuit (skip the actual op)
+   * ```ts
+   * repo.useMiddleware(async ({ operation, context, next }) => {
+   *   if (operation === 'getById' && readOnlyMaintenance) {
+   *     return cachedReadOnlyResponse(context.id);
+   *   }
+   *   return next();
+   * });
+   * ```
+   */
+  useMiddleware(middleware: SqliteMiddleware<TDoc>): this {
+    this._middlewares.push(middleware);
+    return this;
+  }
+
+  /**
+   * Compose the registered middleware chain around `exec`. Outermost
+   * middleware (first registered) wraps innermost. Each middleware sees
+   * the live `RepositoryContext` (mutate before `next()` for input
+   * mutation; inspect / transform the resolved value for output
+   * mutation). Hooks (`after:` / `error:`) still fire from inside
+   * `exec`, so middleware composes WITH plugins, not instead of them.
+   *
+   * Public-ish (private) — `_runOp` calls this with its standard try/catch
+   * envelope; cache-hit branches in `getOne` / `getById` / `getAll` call
+   * it directly so middleware sees every op including cached reads.
+   */
+  private _composeMiddleware<T>(
+    op: string,
+    context: RepositoryContext,
+    exec: () => Promise<T>,
+  ): Promise<T> {
+    if (this._middlewares.length === 0) return exec();
+
+    let chain: () => Promise<T> = exec;
+    for (let i = this._middlewares.length - 1; i >= 0; i--) {
+      const mw = this._middlewares[i] as SqliteMiddleware<TDoc>;
+      const next = chain;
+      chain = async () =>
+        (await mw({
+          operation: op,
+          context,
+          repo: this as unknown as SqliteMinimalRepoView<TDoc>,
+          next: next as () => Promise<unknown>,
+        })) as T;
+    }
+    return chain();
+  }
+
   /**
    * Run a Repository operation under the standard envelope:
    *   - invoke `fn`, emit `after:<op>` with the result on success
    *   - emit `error:<op>` and rethrow on failure
+   *   - compose registered middleware around the whole thing
    *
    * Methods with branched in-try logic that emit `after:*` from multiple
    * paths (`delete`, `aggregatePaginate`) intentionally keep their inline
@@ -199,14 +396,16 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     context: RepositoryContext,
     fn: () => Promise<T>,
   ): Promise<T> {
-    try {
-      const result = await fn();
-      await this._emitAfter(op, context, result);
-      return result;
-    } catch (err) {
-      await this._emitError(op, context, err as Error);
-      throw err;
-    }
+    return this._composeMiddleware(op, context, async () => {
+      try {
+        const result = await fn();
+        await this._emitAfter(op, context, result);
+        return result;
+      } catch (err) {
+        await this._emitError(op, context, err as Error);
+        throw err;
+      }
+    });
   }
 
   async getAll(params: PaginationParams<TDoc> = {}, options: QueryOptions = {}): Promise<unknown> {
@@ -219,8 +418,14 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     });
     const cached = this._cachedValue<unknown>(context);
     if (cached !== undefined) {
-      await this._emitAfter('getAll', context, cached);
-      return cached;
+      // Wrap the cache-hit emit + return inside `_composeMiddleware` so
+      // wrap-style middleware (timing, audit, custom transformers) sees
+      // cached reads exactly the same as DB-backed ones. Mirrors
+      // mongokit's pattern.
+      return this._composeMiddleware('getAll', context, async () => {
+        await this._emitAfter('getAll', context, cached);
+        return cached;
+      });
     }
     return this._runOp('getAll', context, () => {
       const filter = this.#asFilter(
@@ -246,8 +451,12 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     const context = await this._buildContext('getById', { id, ...options });
     const cached = this._cachedValue<TDoc | null>(context);
     if (cached !== undefined) {
-      await this._emitAfter('getById', context, cached);
-      return cached;
+      // Compose middleware around the cache-hit branch so wrap-style
+      // middleware sees cached reads identically to DB-backed ones.
+      return this._composeMiddleware('getById', context, async () => {
+        await this._emitAfter('getById', context, cached);
+        return cached;
+      });
     }
     return this._runOp('getById', context, () => {
       const scope = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
@@ -280,7 +489,49 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     });
   }
 
-  async delete(id: string, options: DeleteOptions = {}): Promise<DeleteResult> {
+  /**
+   * Full-document replace by primary key.
+   *
+   * Distinct from `update(id, partial)`: every column NOT present in
+   * `replacement` is reset to NULL, mirroring mongo's `replaceOne` and
+   * the SCIM 2.0 PUT contract (RFC 7644 §3.5.1). The PK never moves —
+   * if `replacement` carries a different `id` value, it's stripped
+   * from the SET clause.
+   *
+   * Returns the post-replace row or `null` when the id (and any
+   * plugin-injected tenant scope) doesn't match.
+   *
+   * Routes through the standard plugin pipeline — multi-tenant scope,
+   * audit, cache invalidation, and `before:replace` / `after:replace`
+   * hooks all fire. Hosts wiring SCIM 2.0 (`@classytic/arc/scim`) get
+   * correct PUT semantics through this method or via
+   * `bulkWrite([{ replaceOne: { filter, replacement } }])`.
+   *
+   * Use `update(id, partial)` for the partial-overwrite semantic that
+   * leaves untouched columns alone.
+   */
+  async replace(
+    id: string,
+    replacement: Partial<TDoc>,
+    options: WriteOptions = {},
+  ): Promise<TDoc | null> {
+    const context = await this._buildContext('replace', { id, data: replacement, ...options });
+    return this._runOp('replace', context, () => {
+      const payload = (context.data ?? replacement) as Partial<TDoc>;
+      const scope = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
+      const scopeWhere = compileFilterToDrizzle(scope, this.table);
+      return updateActions.replaceById<TDoc>(
+        this.db,
+        this.table,
+        this.idColumn,
+        id,
+        payload,
+        scopeWhere,
+      );
+    });
+  }
+
+  async delete(id: string, options: DeleteOptions = {}): Promise<DeleteResult | null> {
     const context = await this._buildContext('delete', {
       id,
       ...options,
@@ -293,7 +544,6 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
         const rewritten = context.data as Partial<TDoc> | undefined;
         if (rewritten) await this.update(id, rewritten);
         const result: DeleteResult = {
-          success: true,
           message: 'Soft deleted',
           id,
           soft: true,
@@ -310,9 +560,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
         id,
         scopeWhere,
       );
-      const result: DeleteResult = removed
-        ? { success: true, message: 'Deleted', id }
-        : { success: false, message: 'Document not found', id };
+      const result: DeleteResult | null = removed ? { message: 'Deleted', id } : null;
       await this._emitAfter('delete', context, result);
       return result;
     } catch (err) {
@@ -332,8 +580,12 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     const context = await this._buildContext('getOne', { query: filter, ...options });
     const cached = this._cachedValue<TDoc | null>(context);
     if (cached !== undefined) {
-      await this._emitAfter('getOne', context, cached);
-      return cached;
+      // Compose middleware around the cache-hit branch so wrap-style
+      // middleware sees cached reads identically to DB-backed ones.
+      return this._composeMiddleware('getOne', context, async () => {
+        await this._emitAfter('getOne', context, cached);
+        return cached;
+      });
     }
     return this._runOp('getOne', context, () => {
       const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
@@ -414,6 +666,16 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       );
     }
 
+    // Refuse mongo array operators cleanly. Without this check, raw
+    // records like `{ $push: { tags: 'x' } }` fall through to
+    // `db.update(table).set({ $push: ... })` and Drizzle either errors
+    // confusingly or attempts to write a column literally named
+    // `$push`. Mirrors the refusal `claim()` already ships — same op
+    // list, same error shape. SCIM PATCH array ops in
+    // `@classytic/arc/scim` rely on this refusal to surface
+    // `scimType: invalidValue` to IdPs.
+    rejectMongoArrayOperators(update, 'findOneAndUpdate');
+
     // Route portable Update IR to a Drizzle-friendly record once. The
     // UPDATE branch uses `updateData`; the upsert INSERT branch uses
     // `insertData` (different semantics for `inc` and `setOnInsert`).
@@ -466,6 +728,481 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     });
   }
 
+  /**
+   * Atomic compare-and-swap state transition. Mirrors mongokit's
+   * `Repository.claim()` (3.13.0+) — implements `StandardRepo.claim()`
+   * from `@classytic/repo-core/repository`.
+   *
+   * Compiles to a single `UPDATE ... SET [field] = to, ...patch
+   * WHERE id = ? AND [field] = from RETURNING *` round-trip — atomic
+   * across concurrent callers on every Drizzle SQLite driver. Returns
+   * the post-update row on success, `null` when the row exists but its
+   * current state isn't `from` (someone else won), or no row matches
+   * the id.
+   *
+   * **Compound CAS via `transition.where`.** Pass a Filter IR node
+   * (preferred — cross-kit portable) or a flat `Record<string, unknown>`
+   * of equality predicates as `transition.where`. Compiles to additional
+   * SQL `WHERE` clauses ANDed alongside the canonical `[idField] = ?
+   * AND [stateField] = ?` predicate. Field-grade audit shows ~95% of
+   * production claim sites need this (paused guards, retry-time
+   * guards, heartbeat-staleness recovery — see examples below).
+   *
+   * SQL trade-off vs mongokit: Mongo-shaped operator records like
+   * `{ paused: { $ne: true } }` are mongokit-only — they don't compile
+   * cleanly to SQL. Use Filter IR primitives (`ne`, `lt`, `or`, `isNull`,
+   * `not`, ...) from `@classytic/repo-core/filter` for compound predicates
+   * — same input compiles natively in both kits. `$elemMatch` for JSON-
+   * array sub-documents is not supported here; reach for kit-native JSON
+   * helpers or a `raw` Filter IR node.
+   *
+   * **Patch operator-shape support.** Accepts both flat
+   * (`{ field: value }`) and Mongo-style operator
+   * (`{ $set, $inc, $unset }`) patches. The operator shape is the
+   * load-bearing case for versioned-doc state machines — `$inc:
+   * { version: 1 }` alongside the state transition. SQL equivalents:
+   *   - `$set: { col: v }` → flat column overwrite
+   *   - `$inc: { col: n }` → `SET col = COALESCE(col, 0) + n`
+   *   - `$unset: { col: '' }` → `SET col = NULL`
+   *
+   * Mongo array operators (`$push` / `$pull` / `$addToSet`) don't
+   * translate cleanly to flat columns — they throw with a clear
+   * "use the kit-native batch op" error.
+   *
+   * Mixed flat + `$`-prefixed keys in the same patch throw — mongo
+   * would silently drop the flat keys; same trap rule as `claimVersion`.
+   *
+   * Multi-tenant scope, soft-delete filter, cache invalidation, and
+   * audit hooks all flow through automatically — `claim` is registered
+   * in `SQLITE_OP_REGISTRY` (policyKey: 'query', mutates: true), so
+   * plugins that iterate the registry pick it up without changes.
+   *
+   * @example Basic state transition
+   * ```ts
+   * const claimed = await runRepo.claim(runId, { from: 'waiting', to: 'running' }, {
+   *   lastHeartbeat: new Date(),
+   *   workerId: 'worker-12',
+   * });
+   * if (!claimed) return; // someone else got it (or no match)
+   * ```
+   *
+   * @example Compound CAS — paused guard via Filter IR
+   * ```ts
+   * import { ne } from '@classytic/repo-core/filter';
+   * await runRepo.claim(runId, {
+   *   from: 'waiting',
+   *   to: 'running',
+   *   where: ne('paused', true), // skip paused docs
+   * });
+   * ```
+   *
+   * @example Compound CAS — heartbeat staleness via `or` + `isNull`
+   * ```ts
+   * import { or, lt, isNull } from '@classytic/repo-core/filter';
+   * const stale = new Date(Date.now() - 5 * 60_000).toISOString();
+   * await runRepo.claim(runId, {
+   *   from: 'running',
+   *   to: 'waiting',
+   *   where: or(lt('lastHeartbeat', stale), isNull('lastHeartbeat')),
+   * });
+   * ```
+   *
+   * @example Versioned-doc state machine via operator patch
+   * ```ts
+   * await orderRepo.claim(orderId, { from: 'pending', to: 'shipped' }, {
+   *   $set: { shippedAt: new Date().toISOString() },
+   *   $inc: { version: 1 },
+   * });
+   * ```
+   *
+   * Pairs with `defineStateMachine()` from
+   * `@classytic/primitives/state-machine`:
+   *   - State machine validates "is from→to legal in the model?"
+   *   - `claim()` performs the atomic "did we win?"
+   */
+  async claim(
+    id: string,
+    transition: {
+      field?: string;
+      from: unknown;
+      to: unknown;
+      where?: Filter | Record<string, unknown>;
+    },
+    patch: Partial<TDoc> | Record<string, unknown> = {},
+    options: WriteOptions = {},
+  ): Promise<TDoc | null> {
+    const stateField = transition.field ?? 'status';
+    const stateColumn = this.columns[stateField];
+    if (!stateColumn) {
+      throw new Error(
+        `sqlitekit: claim state field "${stateField}" not on table "${getTableName(this.table)}"`,
+      );
+    }
+
+    // Patch normalisation — accept flat (`{ field: value }`) AND
+    // operator (`{ $set, $inc, $unset }`) shapes. Operator shape is the
+    // load-bearing case for versioned docs (commission/yard audit:
+    // `$inc: { version: 1 }` alongside state transition is what blocks
+    // claim() adoption without this). Mixed flat + `$`-prefixed keys
+    // throws — same rule as `claimVersion`; mongo would silently drop
+    // the flat keys, which is the kind of silent data-loss bug we
+    // refuse to ship.
+    const patchRecord = patch as Record<string, unknown>;
+    const patchKeys = Object.keys(patchRecord);
+    const operatorPatchKeys = patchKeys.filter((k) => k.startsWith('$'));
+    if (operatorPatchKeys.length > 0 && operatorPatchKeys.length !== patchKeys.length) {
+      const flatKeys = patchKeys.filter((k) => !k.startsWith('$'));
+      throw new Error(
+        `[claim] patch mixes operators (${operatorPatchKeys.join(', ')}) with raw field keys (${flatKeys.join(', ')}). ` +
+          'Wrap them in $set explicitly, or remove the operator keys.',
+      );
+    }
+
+    let update: Record<string, unknown>;
+    if (operatorPatchKeys.length === 0) {
+      // Flat patch — caller fields land first, then the canonical
+      // state transition LAST so it dominates any caller key collision
+      // (defensive: a wiring-bug `status: 'wrong'` in the patch can't
+      // override the CAS effect).
+      update = { ...patchRecord, [stateField]: transition.to };
+    } else {
+      // Operator patch — compile $set / $inc / $unset to flat column
+      // writes (sqlitekit has no native operator merge, see JSDoc
+      // trade-off note). Caller $set lands first; the canonical state
+      // transition lands LAST so it dominates any caller key collision.
+      const callerSet = (patchRecord['$set'] as Record<string, unknown> | undefined) ?? {};
+      const $unset = (patchRecord['$unset'] as Record<string, unknown> | undefined) ?? {};
+      const $inc = (patchRecord['$inc'] as Record<string, number> | undefined) ?? {};
+      update = { ...callerSet };
+      for (const k of Object.keys($unset)) update[k] = null;
+      for (const [field, delta] of Object.entries($inc)) {
+        const col = this.columns[field];
+        if (!col) {
+          throw new Error(
+            `sqlitekit: claim $inc references unknown column '${field}' on table '${getTableName(this.table)}'`,
+          );
+        }
+        update[field] = sql`coalesce(${col}, 0) + ${delta}`;
+      }
+      // Reject mongo array operators with a clear error — they don't
+      // translate to flat column writes. `$push` / `$pull` /
+      // `$addToSet` are mongo-array-aware operations; SQL equivalents
+      // require kit-specific JSON handling, not the column-write path
+      // claim() compiles to.
+      const unsupported = ['$push', '$pull', '$addToSet', '$pop', '$pullAll'];
+      for (const op of unsupported) {
+        if (op in patchRecord) {
+          throw new Error(
+            `sqlitekit: claim() does not support the '${op}' operator. ` +
+              'Mongo-array operators do not compile to flat column writes — ' +
+              'use a kit-native batch operation or compose the update with `repo.db` directly.',
+          );
+        }
+      }
+      // Ensure the canonical state transition lands LAST.
+      update[stateField] = transition.to;
+    }
+
+    // Build the CAS filter — `where` AND-merges with the canonical
+    // id + state-field keys. Order: `where` first (raw record),
+    // canonical CAS keys spread LAST so they dominate any duplicate
+    // keys in `where`. For Filter-IR `where`, we merge after the
+    // initial filter compile via `mergeFilters`.
+    const whereInput = transition.where;
+    const flatBase: Record<string, unknown> = {
+      ...(whereInput && !isFilter(whereInput) ? (whereInput as Record<string, unknown>) : {}),
+      [this.idField]: id,
+      [stateField]: transition.from,
+    };
+    const whereIR = whereInput && isFilter(whereInput) ? whereInput : undefined;
+
+    const context = await this._buildContext('claim', {
+      id,
+      query: flatBase,
+      data: update,
+      transition,
+      ...options,
+    });
+
+    return this._runOp('claim', context, async () => {
+      // Plugins (multi-tenant, soft-delete) may have augmented
+      // context.query — translate that to a Drizzle WHERE. The CAS
+      // requires an explicit predicate; an empty plugin output would
+      // remove the id+from check, which is unsafe.
+      const baseFilter = this.#asFilter(context.query as Filter | Record<string, unknown>);
+      // AND-merge a Filter-IR `where` if the caller passed one (raw
+      // record `where` was already merged into `flatBase`).
+      const merged = whereIR
+        ? ({ op: 'and' as const, children: Object.freeze([whereIR, baseFilter]) } as Filter)
+        : baseFilter;
+      const where = compileFilterToDrizzle(merged, this.table);
+      if (where === undefined) {
+        // Should be unreachable — `flatBase` always has 2+ keys — but
+        // belt-and-suspenders guard so a hook bug can't degrade to a
+        // table-wide UPDATE.
+        return null;
+      }
+
+      const data = (context.data as Record<string, unknown>) || update;
+      // Drop the PK in case a hook stamped it onto data (matches the
+      // shape of `updateById`).
+      const setClause = { ...data };
+      delete setClause[this.idField];
+
+      const rows = await this.db.update(this.table).set(setClause).where(where).returning();
+      return (rows[0] as TDoc) ?? null;
+    });
+  }
+
+  /**
+   * Optimistic-concurrency CAS via a version stamp. Sibling to
+   * `claim()` — distinct mental model:
+   *   - `claim()` is a state machine: "move from status A to status B, atomically"
+   *   - `claimVersion()` is optimistic locking: "I expect version N; if
+   *     it still is, apply this update and increment the version"
+   *
+   * Compiles to `UPDATE ... SET ..., [versionField] = [versionField] + by
+   * WHERE id = ? AND [versionField] = from RETURNING *` in one round-trip.
+   * Returns the post-update row, or `null` when:
+   *   - the row doesn't exist, OR
+   *   - the row's version isn't `from` (someone else committed first —
+   *     standard race-loss signal)
+   *
+   * The caller's `update` is freeform — pass either a Mongo-style
+   * operator shape (`{ $set: { status: 'submitted' }, $inc: { reads: 1 } }`)
+   * or a flat field-shape object. The version increment is MERGED into
+   * the update so callers don't have to remember to bump the counter.
+   *
+   * SQL trade-off vs mongokit: SQLite has no native operator merge —
+   * this method accepts the same `$set` / `$inc` / `$unset` shapes
+   * mongokit's `claimVersion` does, but compiles them down to flat
+   * column writes. For richer expression updates use Drizzle directly
+   * via `repo.db`.
+   *
+   * Multi-tenant scope, soft-delete, cache invalidation, and audit all
+   * fire — `claimVersion` is in `SQLITE_OP_REGISTRY` (policyKey:
+   * 'query', mutates: true).
+   *
+   * @example Order submission with version check
+   * ```ts
+   * const submitted = await orderRepo.claimVersion(
+   *   orderId,
+   *   { from: order.version },
+   *   { $set: { status: 'submitted', submittedAt: new Date().toISOString() } },
+   * );
+   * if (!submitted) throw new ConcurrentEditError();
+   * ```
+   *
+   * @example Custom version field name + step
+   * ```ts
+   * await runRepo.claimVersion(
+   *   runId,
+   *   { field: 'rev', from: 12, by: 1 },
+   *   { lastHeartbeat: new Date().toISOString() },
+   * );
+   * ```
+   */
+  async claimVersion(
+    id: string,
+    transition: {
+      field?: string;
+      from: number | undefined;
+      by?: number;
+      where?: Filter | Record<string, unknown>;
+    },
+    update: Record<string, unknown>,
+    options: WriteOptions = {},
+  ): Promise<TDoc | null> {
+    const versionField = transition.field ?? 'version';
+    const versionStep = transition.by ?? 1;
+    const versionColumn = this.columns[versionField];
+    if (!versionColumn) {
+      throw new Error(
+        `sqlitekit: claimVersion field "${versionField}" not on table "${getTableName(this.table)}"`,
+      );
+    }
+
+    // Normalize update — accept Mongo-operator shape ({ $set: ... }) or
+    // field-shape ({ status: 'x' }), then merge in the version bump.
+    // Same shape rules `findOneAndUpdate`-style helpers everywhere apply.
+    const operatorKeys = Object.keys(update).filter((k) => k.startsWith('$'));
+    const fieldKeys = Object.keys(update).filter((k) => !k.startsWith('$'));
+    if (operatorKeys.length > 0 && fieldKeys.length > 0) {
+      throw new Error(
+        `[claimVersion] update mixes operators (${operatorKeys.join(', ')}) with raw field keys (${fieldKeys.join(', ')}). ` +
+          'Wrap them in $set explicitly.',
+      );
+    }
+    // Flatten Mongo-style $set / $unset / $inc into a Drizzle-friendly
+    // column-record. Caller `$inc` columns become `coalesce(col, 0) +
+    // delta` SQL fragments so counters compose; caller `$unset` values
+    // become NULLs.
+    const setData: Record<string, unknown> = {};
+    if (operatorKeys.length > 0) {
+      const $set = (update['$set'] as Record<string, unknown> | undefined) ?? {};
+      const $unset = (update['$unset'] as Record<string, unknown> | undefined) ?? {};
+      const $inc = (update['$inc'] as Record<string, number> | undefined) ?? {};
+      Object.assign(setData, $set);
+      for (const k of Object.keys($unset)) setData[k] = null;
+      for (const [field, delta] of Object.entries($inc)) {
+        const col = this.columns[field];
+        if (!col) {
+          throw new Error(
+            `sqlitekit: claimVersion $inc references unknown column '${field}' on table '${getTableName(this.table)}'`,
+          );
+        }
+        setData[field] = sql`coalesce(${col}, 0) + ${delta}`;
+      }
+    } else {
+      Object.assign(setData, update);
+    }
+    // Always bump the version stamp last so caller updates can't
+    // override. `coalesce(col, 0) + step` works on both numeric and
+    // null `from` paths — SQL semantics differ here from mongo, where
+    // `$inc` against null throws. SQL's COALESCE handles the
+    // first-write case (`from === undefined`) without a separate
+    // initialization branch.
+    setData[versionField] = sql`coalesce(${versionColumn}, 0) + ${versionStep}`;
+
+    // Compound CAS — `where` AND-merges with the canonical id +
+    // version keys. Order: `where` first, canonical keys LAST so they
+    // dominate any duplicate keys in `where` (defensive against
+    // wiring bugs).
+    //
+    // `from === undefined` → first-write CAS. SQL semantics: `WHERE
+    // version IS NULL` matches null-valued rows. Unlike mongo, SQL
+    // columns always exist on every row (the schema fixes that), so
+    // there's no "missing column" branch to worry about. `coalesce`
+    // in the SET clause handles the null → 1 initialization in a
+    // single `+ step`-shaped expression.
+    const whereInput = transition.where;
+    const flatBase: Record<string, unknown> = {
+      ...(whereInput && !isFilter(whereInput) ? (whereInput as Record<string, unknown>) : {}),
+      [this.idField]: id,
+    };
+    if (transition.from === undefined) {
+      // Express null-equality as a Filter-IR node so it composes with
+      // any caller-supplied Filter `where`. Plain object filters with
+      // null values would compile to `IS NULL` via the eq → isNull
+      // branch in `compileFilterToDrizzle`.
+      flatBase[versionField] = null;
+    } else {
+      flatBase[versionField] = transition.from;
+    }
+    const whereIR = whereInput && isFilter(whereInput) ? whereInput : undefined;
+
+    const context = await this._buildContext('claimVersion', {
+      id,
+      query: flatBase,
+      data: setData,
+      transition,
+      ...options,
+    });
+
+    return this._runOp('claimVersion', context, async () => {
+      const baseFilter = this.#asFilter(context.query as Filter | Record<string, unknown>);
+      const merged = whereIR
+        ? ({ op: 'and' as const, children: Object.freeze([whereIR, baseFilter]) } as Filter)
+        : baseFilter;
+      const where = compileFilterToDrizzle(merged, this.table);
+      if (where === undefined) return null;
+
+      const data = (context.data as Record<string, unknown>) || setData;
+      const setClause = { ...data };
+      delete setClause[this.idField];
+      const rows = await this.db.update(this.table).set(setClause).where(where).returning();
+      return (rows[0] as TDoc) ?? null;
+    });
+  }
+
+  /**
+   * Streaming reads — async iterator over filtered docs, suitable for
+   * migrations, backfills, schema audits, and any once-a-quarter
+   * "touch every row" job. Goes through the standard `before:cursor`
+   * hook pipeline so multi-tenant scope, soft-delete, and access-control
+   * plugins inject scope BEFORE the underlying query is built.
+   *
+   * Replaces direct Drizzle iteration which bypasses every plugin —
+   * that's how cross-tenant data ends up in migrations.
+   *
+   * Returns an `AsyncIterableIterator<TDoc>` — drive it with `for await`.
+   *
+   * **SQL trade-off vs mongokit**: better-sqlite3 has no async cursor —
+   * its synchronous iterator can't yield to async hooks. sqlitekit
+   * implements streaming as keyset-paginated batched fetches: each
+   * iteration yields a `batchSize` window (default 500) ordered by the
+   * primary key. The driver-level memory footprint is bounded by
+   * `batchSize`, identical to mongoose's batched cursor. The trade-off:
+   * inserts that happen DURING iteration with id < cursor-cursor are
+   * never seen (same as mongoose snapshot semantics with sort by _id
+   * ASC), and the predicate is re-evaluated against each batch's
+   * filtered+id-paginated query.
+   *
+   * @example Backfill across the whole tenant scope
+   * ```ts
+   * for await (const doc of repo.cursor({ migrated: false }, { batchSize: 1000 })) {
+   *   await transformer(doc);
+   *   await repo.update(doc.id, { migrated: true });
+   * }
+   * ```
+   */
+  async *cursor(
+    filter: Record<string, unknown> | Filter = {},
+    options: QueryOptions & {
+      sort?: Record<string, 1 | -1>;
+      batchSize?: number;
+    } = {},
+  ): AsyncIterableIterator<TDoc> {
+    const context = await this._buildContext('cursor', { query: filter, ...options });
+    const resolvedFilter = this.#asFilter(
+      (context.query ?? filter) as Filter | Record<string, unknown> | undefined,
+    );
+    const where = compileFilterToDrizzle(resolvedFilter, this.table);
+    const batchSize = Math.max(1, Math.min(options.batchSize ?? 500, 10_000));
+
+    // Sort: caller-provided OR the table PK ascending. Whichever it is,
+    // we keyset-paginate by the LAST sort field's PK comparison so
+    // batches don't overlap or skip rows. For caller sorts that don't
+    // include a unique tie-breaker, we append the PK to disambiguate.
+    const baseSort = this.#asSortKeys(options.sort);
+    const hasIdInSort = baseSort.some(
+      (s) => (s.column as unknown as { name: string }).name === this.idField,
+    );
+    const sortKeys = hasIdInSort
+      ? baseSort
+      : [...baseSort, { column: this.idColumn, direction: 'asc' as const }];
+    const orderBy = sortKeys.map((s) => (s.direction === 'asc' ? asc(s.column) : desc(s.column)));
+
+    let yieldedCount = 0;
+    let lastId: unknown;
+    try {
+      while (true) {
+        const cursorWhere =
+          lastId === undefined
+            ? where
+            : where !== undefined
+              ? drizzleAnd(where, sql`${this.idColumn} > ${lastId}`)
+              : sql`${this.idColumn} > ${lastId}`;
+        let q = this.db.select().from(this.table).$dynamic();
+        if (cursorWhere !== undefined) q = q.where(cursorWhere);
+        const batch = (await q.orderBy(...orderBy).limit(batchSize)) as TDoc[];
+        if (batch.length === 0) break;
+        for (const doc of batch) {
+          yieldedCount++;
+          yield doc;
+        }
+        if (batch.length < batchSize) break;
+        const last = batch[batch.length - 1] as Record<string, unknown> | undefined;
+        lastId = last?.[this.idField];
+        if (lastId === undefined) break;
+      }
+      await this._emitAfter('cursor', context, { count: yieldedCount });
+    } catch (error) {
+      await this._emitError('cursor', context, error as Error);
+      throw error;
+    }
+  }
+
   async updateMany(
     filter: Record<string, unknown> | Filter,
     update: UpdateInput,
@@ -477,6 +1214,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
           'Use an `UpdateSpec` from `@classytic/repo-core/update` or a flat column record.',
       );
     }
+    rejectMongoArrayOperators(update, 'updateMany');
     // `updateMany` has no INSERT branch — discard `insertData`.
     const { updateData } = this.#compileUpdateInput(update);
 
@@ -526,6 +1264,50 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     insertData: Record<string, unknown> | null;
   } {
     if (!isUpdateSpec(update)) {
+      // Raw mongo-operator record (`{ $set, $unset, $inc, $setOnInsert }`)
+      // — translate to UpdateSpec inline so SCIM PATCH and other consumers
+      // that hand us mongo-shaped patches get the same flat-column writes
+      // they'd see on mongokit. Mixed `$`-prefixed + flat keys throw —
+      // mongo would silently drop the flat keys, the kind of silent
+      // data-loss bug we refuse to ship (same trap rule as `claim`).
+      if (isMongoOperatorRecord(update)) {
+        const record = update as Record<string, unknown>;
+        const keys = Object.keys(record);
+        const operatorKeys = keys.filter((k) => k.startsWith('$'));
+        const flatKeys = keys.filter((k) => !k.startsWith('$'));
+        if (flatKeys.length > 0) {
+          throw new Error(
+            `sqlitekit: update patch mixes operators (${operatorKeys.join(', ')}) with raw field keys (${flatKeys.join(', ')}). ` +
+              'Wrap them in $set explicitly, or remove the operator keys.',
+          );
+        }
+        for (const op of operatorKeys) {
+          if (!(SUPPORTED_MONGO_WRITE_OPS as readonly string[]).includes(op)) {
+            // Defensive — array-op check already ran upstream, but a
+            // brand-new mongo operator would otherwise compile to a
+            // bogus column name. Refuse it loudly.
+            throw new Error(
+              `sqlitekit: update operator '${op}' is not supported. ` +
+                `Supported: ${SUPPORTED_MONGO_WRITE_OPS.join(', ')}.`,
+            );
+          }
+        }
+        const $set = (record['$set'] as Record<string, unknown> | undefined) ?? {};
+        const $unset = (record['$unset'] as Record<string, unknown> | undefined) ?? {};
+        const $inc = (record['$inc'] as Record<string, number> | undefined) ?? {};
+        const $setOnInsert = (record['$setOnInsert'] as Record<string, unknown> | undefined) ?? {};
+        // Re-route through the canonical UpdateSpec compiler so the
+        // INSERT-branch handling for upsert is consistent with native
+        // UpdateSpec callers.
+        const spec = {
+          op: 'update' as const,
+          set: $set,
+          unset: Object.keys($unset),
+          inc: $inc,
+          setOnInsert: $setOnInsert,
+        };
+        return this.#compileUpdateInput(spec);
+      }
       return {
         updateData: update as Record<string, unknown>,
         insertData: null,
@@ -617,80 +1399,191 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     req: AggRequest,
   ): Promise<AggResult<TRow>> {
     const context = await this._buildContext('aggregate', { aggRequest: req });
+    // The unified cache plugin (`@classytic/repo-core/cache`) registers
+    // a `before:aggregate` hook through `_buildContext`. On a hit it
+    // stamps `_cacheHit` + `_cachedResult` onto the context — short-
+    // circuit here so the DB round-trip is skipped. Mirrors `getById`.
+    const cached = this._cachedValue<AggResult<TRow>>(context);
+    if (cached !== undefined) {
+      return this._composeMiddleware('aggregate', context, async () => {
+        await this._emitAfter('aggregate', context, cached);
+        return cached;
+      });
+    }
     return this._runOp('aggregate', context, async () => {
-      const rows = await executeAgg<TRow>(this.db, this.table, this.#normalizeAggReq(req));
-      const result: AggResult<TRow> = { rows };
-      return result;
+      const finalReq = this.#normalizeAggReq(
+        req,
+        context.query as Filter | Record<string, unknown> | undefined,
+      );
+      const rows = await executeAgg<TRow>(
+        this.db,
+        this.table,
+        finalReq,
+        // Forward the foreign-table registry so `req.lookups` can
+        // resolve `LookupSpec.from` to a Drizzle table. Same source
+        // `lookupPopulate` reads — explicit `schema` wins, db's
+        // `fullSchema` is the fallback inside executeAgg.
+        this.schema !== undefined ? { schema: this.schema } : {},
+      );
+      return { rows };
     });
   }
 
   /**
-   * Offset-paginated aggregation. Same IR as `aggregate`, wrapped in
-   * the standard `OffsetPaginationResult` envelope so UI code
-   * paginates aggregated dashboards with the same primitives as raw
-   * document lists.
+   * Invalidate every aggregate-cache entry tagged with ANY of the
+   * given tags. Thin pass-through to `repo.cache.invalidateByTags`
+   * — wired by `cachePlugin({ adapter })` from
+   * `@classytic/repo-core/cache`.
    *
-   * `countStrategy: 'none'` skips the second round-trip that computes
-   * `total`; the envelope reports `total: 0`, `pages: 0`, and derives
-   * `hasNext` from a `LIMIT N+1` peek on the data query.
+   * Pass no tags to wipe the entire cache namespace (requires the
+   * adapter to implement `clear`).
+   *
+   * Returns the count of distinct entries cleared (`-1` when routed
+   * through `adapter.clear()` and the adapter doesn't report a count).
+   * No-op (returns `0`) when no cache plugin is wired.
+   */
+  async invalidateAggregateCache(tags?: readonly string[]): Promise<number> {
+    if (!this.cache) return 0;
+    if (!tags || tags.length === 0) {
+      await this.cache.clear();
+      return -1;
+    }
+    return this.cache.invalidateByTags(tags);
+  }
+
+  /**
+   * Paginated aggregation. Two pagination modes, picked by the
+   * request shape:
+   *
+   * - **Offset (default)** — `page` + `limit`. Returns the standard
+   *   `{ method: 'offset', docs, total, pages, hasNext, hasPrev, ... }`
+   *   envelope. `countStrategy: 'none'` skips the second round-trip
+   *   that computes `total`.
+   * - **Keyset** — `pagination: 'keyset'` (or `after` set). Returns
+   *   `{ method: 'keyset', docs, hasMore, next, limit }`. `sort` is
+   *   required — the cursor encodes the sort-key tuple of the last
+   *   row. Each page passes the previous response's `next` back as
+   *   `after`. Scales to arbitrary group counts because the planner
+   *   uses `(sort_keys) > (cursor)` instead of `OFFSET N`.
    */
   async aggregatePaginate<TRow extends Record<string, unknown> = Record<string, unknown>>(
     req: AggPaginationRequest,
-  ): Promise<OffsetPaginationResult<TRow>> {
+  ): Promise<OffsetPaginationResult<TRow> | KeysetAggPaginationResult<TRow>> {
     const context = await this._buildContext('aggregatePaginate', { aggRequest: req });
-    const page = Math.max(1, req.page ?? 1);
     const limit = Math.max(1, Math.min(req.limit ?? 20, 1000));
-    const countStrategy = req.countStrategy ?? 'exact';
-    const offset = (page - 1) * limit;
+    const useKeyset = isKeysetMode(req);
 
-    try {
-      const normalized = this.#normalizeAggReq(req);
-      if (countStrategy === 'none') {
-        // Peek one extra row to detect hasNext without running COUNT.
-        const peek = await executeAgg<TRow>(this.db, this.table, {
-          ...normalized,
-          limit: limit + 1,
-          offset,
-        });
-        const hasNext = peek.length > limit;
-        const docs = hasNext ? peek.slice(0, limit) : peek;
-        const result: OffsetPaginationResult<TRow> = {
-          method: 'offset',
-          docs,
-          page,
-          limit,
-          total: 0,
-          pages: 0,
-          hasNext,
-          hasPrev: page > 1,
-        };
+    // Unified cache short-circuit — the cache plugin's
+    // `before:aggregatePaginate` hook (registered through `_buildContext`)
+    // stamps `_cacheHit` on the context when the cached envelope is
+    // fresh. The full envelope (offset OR keyset shape) is cached;
+    // different page params hash to different keys, so per-page caching
+    // is automatic.
+    const cachedEnvelope = this._cachedValue<
+      OffsetPaginationResult<TRow> | KeysetAggPaginationResult<TRow>
+    >(context);
+    if (cachedEnvelope !== undefined) {
+      return this._composeMiddleware('aggregatePaginate', context, async () => {
+        await this._emitAfter('aggregatePaginate', context, cachedEnvelope);
+        return cachedEnvelope;
+      });
+    }
+
+    return this._composeMiddleware('aggregatePaginate', context, async () => {
+      try {
+        const normalized = this.#normalizeAggReq(
+          req,
+          context.filters as Filter | Record<string, unknown> | undefined,
+        );
+        const result = await this.#executeAggregatePaginate<TRow>(normalized, useKeyset, limit);
         await this._emitAfter('aggregatePaginate', context, result);
         return result;
+      } catch (err) {
+        await this._emitError('aggregatePaginate', context, err as Error);
+        throw err;
       }
+    });
+  }
 
-      // Run data + count in parallel — SQLite in-memory + WAL-file both
-      // handle concurrent reads on the same connection fine.
-      const [docs, total] = await Promise.all([
-        executeAgg<TRow>(this.db, this.table, { ...normalized, limit, offset }),
-        countAggGroups(this.db, this.table, normalized),
-      ]);
-      const pages = Math.max(1, Math.ceil(total / limit));
-      const result: OffsetPaginationResult<TRow> = {
+  /**
+   * Internal: the actual aggregate-paginate execution body. Extracted
+   * so `aggregatePaginate` can wrap it in the cache layer without
+   * duplicating the keyset / offset branch logic.
+   */
+  async #executeAggregatePaginate<TRow extends Record<string, unknown>>(
+    normalized: AggPaginationRequest,
+    useKeyset: boolean,
+    limit: number,
+  ): Promise<OffsetPaginationResult<TRow> | KeysetAggPaginationResult<TRow>> {
+    const aggOpts = this.schema !== undefined ? { schema: this.schema } : {};
+
+    // ── Keyset path ─────────────────────────────────────────────
+    if (useKeyset) {
+      if (!normalized.sort || Object.keys(normalized.sort).length === 0) {
+        throw new Error(
+          'sqlitekit/aggregatePaginate: keyset pagination requires `sort` — the cursor anchors on the sort-key tuple',
+        );
+      }
+      const cursor = normalized.after ? decodeAggCursor(normalized.after) : undefined;
+      const peek = await executeAgg<TRow>(
+        this.db,
+        this.table,
+        { ...normalized, limit: limit + 1 },
+        cursor ? { ...aggOpts, keysetCursor: cursor } : aggOpts,
+      );
+      const hasMore = peek.length > limit;
+      const data = hasMore ? peek.slice(0, limit) : peek;
+      const next =
+        hasMore && data.length > 0
+          ? encodeAggCursor(data[data.length - 1] as Record<string, unknown>, normalized.sort)
+          : null;
+      return { method: 'keyset', data, limit, hasMore, next };
+    }
+
+    // ── Offset path ─────────────────────────────────────────────
+    const page = Math.max(1, normalized.page ?? 1);
+    const countStrategy = normalized.countStrategy ?? 'exact';
+    const offset = (page - 1) * limit;
+
+    if (countStrategy === 'none') {
+      // Peek one extra row to detect hasNext without running COUNT.
+      const peek = await executeAgg<TRow>(
+        this.db,
+        this.table,
+        { ...normalized, limit: limit + 1, offset },
+        aggOpts,
+      );
+      const hasNext = peek.length > limit;
+      const data = hasNext ? peek.slice(0, limit) : peek;
+      return {
         method: 'offset',
-        docs,
+        data,
         page,
         limit,
-        total,
-        pages,
-        hasNext: page * limit < total,
+        total: 0,
+        pages: 0,
+        hasNext,
         hasPrev: page > 1,
       };
-      await this._emitAfter('aggregatePaginate', context, result);
-      return result;
-    } catch (err) {
-      await this._emitError('aggregatePaginate', context, err as Error);
-      throw err;
     }
+
+    // Run data + count in parallel — SQLite in-memory + WAL-file both
+    // handle concurrent reads on the same connection fine.
+    const [pageData, total] = await Promise.all([
+      executeAgg<TRow>(this.db, this.table, { ...normalized, limit, offset }, aggOpts),
+      countAggGroups(this.db, this.table, normalized, aggOpts),
+    ]);
+    const pages = Math.max(1, Math.ceil(total / limit));
+    return {
+      method: 'offset',
+      data: pageData,
+      page,
+      limit,
+      total,
+      pages,
+      hasNext: page * limit < total,
+      hasPrev: page > 1,
+    };
   }
 
   /**
@@ -727,7 +1620,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
    *   page: 1,
    *   limit: 20,
    * });
-   * // result.docs[0]: { id, name, ..., department: {...} | null, tasks: [{id, title}, ...] }
+   * // result.data[0]: { id, name, ..., department: {...} | null, tasks: [{id, title}, ...] }
    * // result: { method: 'offset', docs, page, limit, total, pages, hasNext, hasPrev }
    * ```
    */
@@ -800,7 +1693,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
     filter: Record<string, unknown> | Filter,
     data: Partial<TDoc>,
     options: WriteOptions = {},
-  ): Promise<TDoc> {
+  ): Promise<{ doc: TDoc; created: boolean }> {
     const context = await this._buildContext('getOrCreate', {
       query: filter,
       data,
@@ -1065,8 +1958,8 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
             throw new Error('sqlitekit: bulkWrite update/replace op requires a non-empty filter');
           }
           // SELECT the PK of the first match so we can route through
-          // updateById (which gives us a deterministic single-row update
-          // on backends without LIMIT-on-UPDATE support).
+          // updateById / replaceById (which give us a deterministic
+          // single-row write on backends without LIMIT-on-UPDATE support).
           const rows = await tx
             .select({ id: this.idColumn })
             .from(this.table)
@@ -1074,14 +1967,15 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
             .limit(1);
           const id = (rows[0] as { id: unknown } | undefined)?.id;
           if (id !== undefined) {
-            const updated = await updateActions.updateById<TDoc>(
-              tx,
-              this.table,
-              this.idColumn,
-              id,
-              data,
-            );
-            if (updated) {
+            // `replaceOne` MUST overwrite every column (mongo's
+            // `replaceOne` semantic, SCIM 2.0 PUT contract). Routing
+            // through `replaceById` (UPDATE-with-explicit-NULLs)
+            // guarantees omitted fields don't survive — that was the
+            // earlier bug shape that broke SCIM PUT clients.
+            const written = isReplace
+              ? await updateActions.replaceById<TDoc>(tx, this.table, this.idColumn, id, data)
+              : await updateActions.updateById<TDoc>(tx, this.table, this.idColumn, id, data);
+            if (written) {
               result.matchedCount += 1;
               result.modifiedCount += 1;
             }
@@ -1137,11 +2031,16 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
    * the coercion once at the Repository boundary so the downstream
    * compiler always sees a Filter.
    */
-  #normalizeAggReq(req: AggRequest): AggRequest {
+  #normalizeAggReq(req: AggRequest, policyScope?: Filter | Record<string, unknown>): AggRequest {
     const next: AggRequest = { ...req };
-    if (req.filter !== undefined) {
-      next.filter = this.#asFilter(req.filter as Filter | Record<string, unknown>);
-    }
+    const callerFilter =
+      req.filter !== undefined
+        ? this.#asFilter(req.filter as Filter | Record<string, unknown>)
+        : undefined;
+    const mergedFilter = this.#mergeFilters(callerFilter, policyScope);
+    if (mergedFilter !== undefined) next.filter = mergedFilter;
+    else delete next.filter;
+
     if (req.having !== undefined) {
       next.having = this.#asFilter(req.having as Filter | Record<string, unknown>);
     }
@@ -1170,17 +2069,13 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
 
   /** Coerce input into a Filter IR node. Flat records become AND-of-eq. */
   #asFilter(input: Filter | Record<string, unknown> | undefined): Filter {
+    // Delegates to `recordToFilter` so plain-record inputs with
+    // operator-object values (`{ price: { gte: 100 } }`,
+    // `{ deletedAt: null }`) compile to the correct IR shape.
+    // Already-IR inputs pass through unchanged via `recordToFilter`'s
+    // `.op` short-circuit.
     if (!input) return TRUE;
-    if (isFilter(input)) return input;
-    const entries = Object.entries(input);
-    if (entries.length === 0) return TRUE;
-    const children: Filter[] = entries.map(([field, value]) => ({
-      op: 'eq' as const,
-      field,
-      value,
-    }));
-    if (children.length === 1) return children[0] as Filter;
-    return { op: 'and' as const, children: Object.freeze(children) };
+    return recordToFilter(input);
   }
 
   /** Translate the various sort shapes accepted by repo-core into typed keys. */

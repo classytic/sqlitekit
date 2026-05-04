@@ -270,6 +270,6 @@ describe('ttlPlugin — getExpired escape hatch', () => {
 
     const fn = (repo as unknown as { getExpired: () => Promise<{ docs: Session[] }> }).getExpired;
     const expired = await fn.call(repo);
-    expect(expired.docs.map((s) => s.id).sort()).toEqual(['dead1', 'dead2']);
+    expect(expired.data.map((s) => s.id).sort()).toEqual(['dead1', 'dead2']);
   });
 });

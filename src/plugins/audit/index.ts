@@ -19,9 +19,24 @@ import type { Plugin, RepositoryBase } from '@classytic/repo-core/repository';
 type Context = Record<string, unknown> & {
   id?: unknown;
   data?: Record<string, unknown>;
+  /** Per-call opt-out. Mirrors mongokit's `context.skipPlugins`. */
+  skipPlugins?: readonly string[];
 };
 
 export type AuditOperation = 'create' | 'update' | 'delete' | 'restore' | 'findOneAndUpdate';
+
+const PLUGIN_NAME = 'audit';
+
+/**
+ * True when the caller passed `skipPlugins: ['audit', ...]` on the
+ * operation options bag. Mirrors mongokit's per-call opt-out:
+ * security/correctness plugins (multi-tenant, soft-delete) ignore the
+ * flag; observability/audit/log plugins respect it.
+ */
+function isSkipped(context: Context): boolean {
+  const list = context.skipPlugins;
+  return Array.isArray(list) && list.includes(PLUGIN_NAME);
+}
 
 export interface AuditEntry {
   resource: string;
@@ -58,13 +73,18 @@ export function auditPlugin(options: AuditPluginOptions): Plugin {
   const ops = options.operations ?? DEFAULT_OPS;
 
   return {
-    name: 'audit',
+    name: PLUGIN_NAME,
     apply(repo: RepositoryBase): void {
       for (const op of ops) {
         repo.on(
           `after:${op}`,
           async (payload: unknown) => {
             const { context, result } = payload as { context: Context; result: unknown };
+            // Per-call opt-out — caller passed `skipPlugins: ['audit']`
+            // in the op options; honor it here. Security/correctness
+            // plugins (multi-tenant, soft-delete) deliberately do NOT
+            // honor the flag; audit / observability ones do.
+            if (isSkipped(context)) return;
             const entry: AuditEntry = {
               resource: repo.modelName,
               action: op,

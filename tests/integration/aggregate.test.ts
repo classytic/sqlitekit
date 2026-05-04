@@ -11,6 +11,8 @@
 
 import { gt } from '@classytic/repo-core/filter';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { multiTenantPlugin } from '../../src/plugins/multi-tenant/index.js';
+import { softDeletePlugin } from '../../src/plugins/soft-delete/index.js';
 import { SqliteRepository } from '../../src/repository/index.js';
 import { usersTable } from '../fixtures/drizzle-schema.js';
 import { makeFixtureDb, makeUser, type TestDb, type TestUser } from '../helpers/fixtures.js';
@@ -132,7 +134,7 @@ describe('aggregatePaginate', () => {
     expect(result.pages).toBe(3);
     expect(result.hasNext).toBe(true);
     expect(result.hasPrev).toBe(false);
-    expect(result.docs.map((d) => d.role)).toEqual(['a', 'b']);
+    expect(result.data.map((d) => d.role)).toEqual(['a', 'b']);
   });
 
   it('follows-on page yields the next slice', async () => {
@@ -144,7 +146,7 @@ describe('aggregatePaginate', () => {
       limit: 2,
     });
 
-    expect(result.docs.map((d) => d.role)).toEqual(['c', 'd']);
+    expect(result.data.map((d) => d.role)).toEqual(['c', 'd']);
     expect(result.hasNext).toBe(true);
     expect(result.hasPrev).toBe(true);
   });
@@ -162,7 +164,7 @@ describe('aggregatePaginate', () => {
     expect(result.total).toBe(0);
     expect(result.pages).toBe(0);
     expect(result.hasNext).toBe(true);
-    expect(result.docs).toHaveLength(2);
+    expect(result.data).toHaveLength(2);
   });
 
   it('scalar aggregation paginates to a single-row first page', async () => {
@@ -174,7 +176,7 @@ describe('aggregatePaginate', () => {
 
     expect(result.total).toBe(1);
     expect(result.pages).toBe(1);
-    expect(result.docs).toEqual([{ count: 7 }]);
+    expect(result.data).toEqual([{ count: 7 }]);
   });
 
   it('respects having in count + data', async () => {
@@ -189,6 +191,73 @@ describe('aggregatePaginate', () => {
 
     // Only roles 'a' and 'b' have count > 1.
     expect(result.total).toBe(2);
-    expect(result.docs.map((d) => d.role)).toEqual(['a', 'b']);
+    expect(result.data.map((d) => d.role)).toEqual(['a', 'b']);
+  });
+});
+
+describe('aggregate policy scope', () => {
+  let db: TestDb;
+
+  afterEach(() => db.close());
+
+  it('applies multi-tenant scope to aggregate and aggregatePaginate', async () => {
+    db = await makeFixtureDb();
+    const aliceRepo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [multiTenantPlugin({ resolveTenantId: () => 'org_alice' })],
+    });
+    const bobRepo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [multiTenantPlugin({ resolveTenantId: () => 'org_bob' })],
+    });
+
+    await aliceRepo.create(makeUser({ id: 'a1', role: 'admin', age: 10 }));
+    await aliceRepo.create(makeUser({ id: 'a2', role: 'admin', age: 20 }));
+    await bobRepo.create(makeUser({ id: 'b1', role: 'admin', age: 100 }));
+
+    const aggregate = await aliceRepo.aggregate<{ role: string; totalAge: number }>({
+      groupBy: 'role',
+      measures: { totalAge: { op: 'sum', field: 'age' } },
+    });
+    expect(aggregate.rows).toEqual([{ role: 'admin', totalAge: 30 }]);
+
+    const page = await aliceRepo.aggregatePaginate<{ role: string; totalAge: number }>({
+      groupBy: 'role',
+      measures: { totalAge: { op: 'sum', field: 'age' } },
+      page: 1,
+      limit: 10,
+    });
+    expect(page.total).toBe(1);
+    expect(page.data).toEqual([{ role: 'admin', totalAge: 30 }]);
+  });
+
+  it('applies soft-delete scope to aggregate and aggregatePaginate', async () => {
+    db = await makeFixtureDb();
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [softDeletePlugin()],
+    });
+
+    await repo.create(makeUser({ id: 'u1', role: 'admin', age: 10 }));
+    await repo.create(makeUser({ id: 'u2', role: 'admin', age: 20 }));
+    await repo.delete('u2');
+
+    const aggregate = await repo.aggregate<{ role: string; totalAge: number }>({
+      groupBy: 'role',
+      measures: { totalAge: { op: 'sum', field: 'age' } },
+    });
+    expect(aggregate.rows).toEqual([{ role: 'admin', totalAge: 10 }]);
+
+    const page = await repo.aggregatePaginate<{ role: string; totalAge: number }>({
+      groupBy: 'role',
+      measures: { totalAge: { op: 'sum', field: 'age' } },
+      page: 1,
+      limit: 10,
+    });
+    expect(page.total).toBe(1);
+    expect(page.data).toEqual([{ role: 'admin', totalAge: 10 }]);
   });
 });

@@ -62,24 +62,26 @@ describe('getOrCreate', () => {
 
   afterEach(() => db.close());
 
-  it('returns the existing row when filter matches', async () => {
+  it('returns the existing row when filter matches (created: false)', async () => {
     await repo.create(makeUser({ id: 'u1', email: 'alice@example.com', name: 'Alice' }));
     const result = await repo.getOrCreate(
       { email: 'alice@example.com' },
       makeUser({ id: 'u-new', email: 'alice@example.com', name: 'Not Used' }),
     );
-    expect(result.id).toBe('u1');
-    expect(result.name).toBe('Alice');
+    expect(result.doc.id).toBe('u1');
+    expect(result.doc.name).toBe('Alice');
+    expect(result.created).toBe(false);
     expect(await repo.count()).toBe(1);
   });
 
-  it('inserts the data payload when no row matches', async () => {
+  it('inserts the data payload when no row matches (created: true)', async () => {
     const result = await repo.getOrCreate(
       { email: 'fresh@example.com' },
       makeUser({ id: 'u-fresh', email: 'fresh@example.com', name: 'Fresh' }),
     );
-    expect(result.id).toBe('u-fresh');
-    expect(result.name).toBe('Fresh');
+    expect(result.doc.id).toBe('u-fresh');
+    expect(result.doc.name).toBe('Fresh');
+    expect(result.created).toBe(true);
     expect(await repo.count()).toBe(1);
   });
 });

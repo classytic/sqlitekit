@@ -30,10 +30,13 @@ import {
   departmentsTable,
   employeesTable,
   employeeTasksTable,
+  outboxLeaseTable,
   postsTable,
+  runsTable,
   sessionsTable,
   tasksTable,
   usersTable,
+  versionedOrdersTable,
 } from '../fixtures/drizzle-schema.js';
 
 export interface TestDb {
@@ -70,6 +73,9 @@ export async function makeFixtureDb(): Promise<TestDb> {
       employees: employeesTable,
       employee_tasks: employeeTasksTable,
       posts: postsTable,
+      runs: runsTable,
+      versioned_orders: versionedOrdersTable,
+      outbox: outboxLeaseTable,
     },
   }) as unknown as SqliteDb;
   return {

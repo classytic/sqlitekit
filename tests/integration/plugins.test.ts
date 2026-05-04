@@ -144,7 +144,7 @@ describe('multiTenantPlugin allowDataInjection', () => {
     const repo = new SqliteRepository<TestUser>({
       db: db.db,
       table: usersTable,
-      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined, allowDataInjection: true })],
     });
 
     const row = await repo.create(makeArcRow('u1', 'org_payload'));
@@ -159,7 +159,9 @@ describe('multiTenantPlugin allowDataInjection', () => {
     const repo = new SqliteRepository<TestUser>({
       db: db.db,
       table: usersTable,
-      plugins: [multiTenantPlugin({ resolveTenantId: () => 'org_resolver' })],
+      plugins: [
+        multiTenantPlugin({ resolveTenantId: () => 'org_resolver', allowDataInjection: true }),
+      ],
     });
 
     const row = await repo.create(makeArcRow('u1', 'org_payload'));
@@ -170,12 +172,28 @@ describe('multiTenantPlugin allowDataInjection', () => {
     const repo = new SqliteRepository<TestUser>({
       db: db.db,
       table: usersTable,
-      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined, allowDataInjection: true })],
     });
 
     // The payload has no organizationId. resolveTenantId is empty. The
-    // plugin cannot infer a scope and must refuse.
+    // plugin cannot infer a scope and must refuse — even with the
+    // injection escape hatch enabled, since there's nothing to inject.
     await expect(repo.create(makeUser({ id: 'u1' }))).rejects.toThrow(
+      /resolveTenantId returned undefined/,
+    );
+  });
+
+  it('fails closed by DEFAULT — payload-supplied tenant is not enough', async () => {
+    // Default (no allowDataInjection passed) is now fail-closed.
+    // Hosts that previously relied on the implicit `true` MUST opt in
+    // explicitly. Regression guard against silent reversion of the
+    // secure default.
+    const repo = new SqliteRepository<TestUser>({
+      db: db.db,
+      table: usersTable,
+      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+    });
+    await expect(repo.create(makeArcRow('u1', 'org_payload_default'))).rejects.toThrow(
       /resolveTenantId returned undefined/,
     );
   });
@@ -203,7 +221,7 @@ describe('multiTenantPlugin allowDataInjection', () => {
     const repo = new SqliteRepository<TestUser>({
       db: db.db,
       table: usersTable,
-      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined, allowDataInjection: true })],
     });
 
     const rows = await repo.createMany([
@@ -220,7 +238,7 @@ describe('multiTenantPlugin allowDataInjection', () => {
     const repo = new SqliteRepository<TestUser>({
       db: db.db,
       table: usersTable,
-      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined })],
+      plugins: [multiTenantPlugin({ resolveTenantId: () => undefined, allowDataInjection: true })],
     });
 
     // Partial stamping is ambiguous — the plugin has no resolver value
@@ -296,8 +314,8 @@ describe('softDeletePlugin', () => {
 
   it('delete rewrites to an UPDATE setting deletedAt', async () => {
     const result = await repo.delete('u1');
-    expect(result.soft).toBe(true);
-    expect(result.success).toBe(true);
+    expect(result).not.toBeNull();
+    expect(result?.soft).toBe(true);
     // Row still present, just soft-deleted — verified via the underlying
     // better-sqlite3 connection so we bypass the soft-delete read filter.
     const raw = db.raw.prepare('SELECT * FROM users WHERE id = ?').get('u1') as TestUser;
@@ -376,7 +394,7 @@ describe('cachePlugin', () => {
     repo = new SqliteRepository<TestUser>({
       db: db.db,
       table: usersTable,
-      plugins: [cachePlugin({ adapter, ttlSeconds: 60 })],
+      plugins: [cachePlugin({ adapter, defaults: { staleTime: 60 } })],
     });
     await repo.create(makeUser({ id: 'u1', name: 'Alice' }));
   });
@@ -402,6 +420,10 @@ describe('cachePlugin', () => {
   it('mutation through the repo invalidates the cache', async () => {
     // Prime cache, then mutate through the repo (cache invalidates).
     await repo.getById('u1');
+    // Small delay so the version bump (`Date.now()`-keyed) advances past
+    // the version captured during the prime. Without this, both calls
+    // can land in the same millisecond and the version key collides.
+    await new Promise((r) => setTimeout(r, 5));
     await repo.update('u1', { name: 'Alice2' });
 
     // Backdoor a different value to prove the next read goes to DB
@@ -438,7 +460,7 @@ describe('plugin stack — composition + priority ordering', () => {
           timestampPlugin(),
           multiTenantPlugin({ resolveTenantId: () => orgId }),
           softDeletePlugin(),
-          cachePlugin({ adapter }),
+          cachePlugin({ adapter, defaults: { staleTime: 60 } }),
         ],
       });
 

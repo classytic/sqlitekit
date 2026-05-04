@@ -15,6 +15,20 @@
       "when": 1745170000000,
       "tag": "0001_lookup_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1745260000000,
+      "tag": "0002_field_grade_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1745350000000,
+      "tag": "0003_runs_compound_columns",
+      "breakpoints": true
     }
   ]
 }

@@ -11,6 +11,9 @@
  */
 
 export {
+  type SqliteMiddleware,
+  type SqliteMiddlewareContext,
+  type SqliteMinimalRepoView,
   type SqliteQueryOptions,
   SqliteRepository,
   type SqliteRepositoryOptions,

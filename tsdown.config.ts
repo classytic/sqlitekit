@@ -15,6 +15,7 @@ export default defineConfig({
     'query/parse': 'src/query/parse.ts',
     'actions/index': 'src/actions/index.ts',
     'migrate/index': 'src/migrate/index.ts',
+    operations: 'src/operations.ts',
     'plugins/timestamp/index': 'src/plugins/timestamp/index.ts',
     'plugins/soft-delete/index': 'src/plugins/soft-delete/index.ts',
     'plugins/multi-tenant/index': 'src/plugins/multi-tenant/index.ts',
@@ -24,6 +25,15 @@ export default defineConfig({
     'plugins/vacuum/index': 'src/plugins/vacuum/index.ts',
     'plugins/fts/index': 'src/plugins/fts/index.ts',
     'plugins/vector/index': 'src/plugins/vector/index.ts',
+    'plugins/lease/index': 'src/plugins/lease/index.ts',
+    // Framework-agnostic adapter — produces `DataAdapter<TDoc>` from
+    // `@classytic/repo-core/adapter`. Any host consuming that contract
+    // (arc 3+, future arc-next, custom frameworks) wires this in.
+    'adapter/index': 'src/adapter/index.ts',
+    // Better Auth × Drizzle overlay — bridges BA-managed sqlite tables into
+    // `DataAdapter<TDoc>` so any host (arc, custom) gets pagination, query
+    // parser, OpenAPI, audit, permissions over BA's user/org/member tables.
+    'better-auth/index': 'src/better-auth/index.ts',
   },
   format: 'esm',
   platform: 'neutral',
