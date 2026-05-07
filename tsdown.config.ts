@@ -26,6 +26,12 @@ export default defineConfig({
     'plugins/fts/index': 'src/plugins/fts/index.ts',
     'plugins/vector/index': 'src/plugins/vector/index.ts',
     'plugins/lease/index': 'src/plugins/lease/index.ts',
+    // Distributed lock primitive — implements `LockAdapter` from
+    // `@classytic/repo-core/lock` against the sqlitekit driver
+    // interface. Used for cron leader election in multi-replica
+    // deployments where SQLite is the primary store (edge / Pi /
+    // single-node hosts).
+    'lock/index': 'src/lock/index.ts',
     // Framework-agnostic adapter — produces `DataAdapter<TDoc>` from
     // `@classytic/repo-core/adapter`. Any host consuming that contract
     // (arc 3+, future arc-next, custom frameworks) wires this in.
