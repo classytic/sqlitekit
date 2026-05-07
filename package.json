@@ -1,6 +1,6 @@
 {
   "name": "@classytic/sqlitekit",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "SQLite repository kit built on @classytic/repo-core — works with better-sqlite3 (Node) and expo-sqlite (React Native) via a pluggable driver interface.",
   "type": "module",
   "sideEffects": false,
@@ -117,6 +117,10 @@
     "./plugins/lease": {
       "types": "./dist/plugins/lease/index.d.mts",
       "default": "./dist/plugins/lease/index.mjs"
+    },
+    "./lock": {
+      "types": "./dist/lock/index.d.mts",
+      "default": "./dist/lock/index.mjs"
     },
     "./package.json": "./package.json"
   },
