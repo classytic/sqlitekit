@@ -39,6 +39,7 @@ import type {
   BulkWriteResult,
   DeleteOptions,
   DeleteResult,
+  FindAllOptions,
   KeysetAggPaginationResult,
   LookupPopulateOptions,
   LookupPopulateResult,
@@ -620,12 +621,15 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
 
   async findAll(
     filter: Record<string, unknown> | Filter = {},
-    options: QueryOptions = {},
+    options: FindAllOptions = {},
   ): Promise<TDoc[]> {
     const context = await this._buildContext('findAll', { query: filter, ...options });
     const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
     const where = compileFilterToDrizzle(f, this.table);
-    const result = await readActions.findAll<TDoc>(this.db, this.table, where);
+    // Forward optional `limit` from FindAllOptions through to the action.
+    // Hooks may override via `context['limit']`; fall back to the caller's value.
+    const limit = (context['limit'] as number | undefined) ?? options.limit;
+    const result = await readActions.findAll<TDoc>(this.db, this.table, where, undefined, limit);
     await this._emitAfter('findAll', context, result);
     return result;
   }

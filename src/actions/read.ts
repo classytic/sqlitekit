@@ -60,10 +60,14 @@ export async function findAll<TDoc>(
   table: SQLiteTable,
   where: SQL | undefined,
   orderBy?: SQL[],
+  limit?: number,
 ): Promise<TDoc[]> {
   let q = db.select().from(table).$dynamic();
   if (where) q = q.where(where);
   if (orderBy && orderBy.length > 0) q = q.orderBy(...orderBy);
+  // Cap at the driver level when set. Treat 0 / negative as "no limit"
+  // so callers can pass `options.limit ?? undefined` without a guard.
+  if (typeof limit === 'number' && limit > 0) q = q.limit(limit);
   const rows = await q;
   return rows as TDoc[];
 }
