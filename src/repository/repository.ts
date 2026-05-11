@@ -142,12 +142,23 @@ function isMongoOperatorRecord(update: unknown): boolean {
   return keys.some((k) => k.startsWith('$'));
 }
 
-/** Construction options for the Drizzle-backed `SqliteRepository`. */
-export interface SqliteRepositoryOptions extends Omit<RepositoryBaseOptions, 'name'> {
+/**
+ * Construction options for the Drizzle-backed `SqliteRepository`.
+ *
+ * Generic over the concrete table type so `sqliteTable(...)` return values
+ * (which carry their specific column shape as `SQLiteTableWithColumns<...>`)
+ * flow through without casts. Drizzle's `SQLiteTable<TableConfig>` is
+ * generic-invariant, so the previous bare `table: SQLiteTable` forced every
+ * caller to cast their concrete table at the boundary. With `TTable`
+ * defaulted to `SQLiteTable`, existing call sites stay backward-compatible
+ * while concrete tables infer cleanly.
+ */
+export interface SqliteRepositoryOptions<TTable extends SQLiteTable = SQLiteTable>
+  extends Omit<RepositoryBaseOptions, 'name'> {
   /** Drizzle SQLite database — better-sqlite3 / libsql / expo-sqlite all work. */
   db: SqliteDb;
   /** Drizzle SQLite table — the `sqliteTable(...)` return value, not a string. */
-  table: SQLiteTable;
+  table: TTable;
   /**
    * Override the column treated as the primary key. Defaults to the
    * column marked `.primaryKey()` on the Drizzle table. Pass an
@@ -227,12 +238,15 @@ export type SqliteMiddleware<TDoc = unknown> = (
  * (findOneAndUpdate, updateMany, deleteMany, upsert, increment,
  * aggregate, distinct).
  */
-export class SqliteRepository<TDoc extends Record<string, unknown>>
+export class SqliteRepository<
+    TDoc extends Record<string, unknown>,
+    TTable extends SQLiteTable = SQLiteTable,
+  >
   extends RepositoryBase
   implements MinimalRepo<TDoc>
 {
   readonly db: SqliteDb;
-  readonly table: SQLiteTable;
+  readonly table: TTable;
   readonly idField: string;
   readonly idColumn: SQLiteColumn;
   readonly columns: Readonly<Record<string, SQLiteColumn>>;
@@ -253,7 +267,7 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
    */
   cache?: RepositoryCacheHandle;
 
-  constructor(options: SqliteRepositoryOptions) {
+  constructor(options: SqliteRepositoryOptions<TTable>) {
     const { plugins, hooks, pluginOrderChecks, name, table, db, idField, schema } = options;
     if (!table) {
       throw new Error('sqlitekit: SqliteRepository requires a Drizzle `table`');
@@ -953,7 +967,15 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       const setClause = { ...data };
       delete setClause[this.idField];
 
-      const rows = await this.db.update(this.table).set(setClause).where(where).returning();
+      // Cast: drizzle's `.set()` is typed against TTable's inferred column shape,
+      // but at this internal layer we operate on `Record<string, unknown>` —
+      // upstream hooks may have mutated arbitrary keys. Runtime is safe because
+      // every column referenced was sourced from this.columns at action time.
+      const rows = await this.db
+        .update(this.table)
+        .set(setClause as never)
+        .where(where)
+        .returning();
       return (rows[0] as TDoc) ?? null;
     });
   }
@@ -1114,7 +1136,13 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
       const data = (context.data as Record<string, unknown>) || setData;
       const setClause = { ...data };
       delete setClause[this.idField];
-      const rows = await this.db.update(this.table).set(setClause).where(where).returning();
+      // Cast: see updateMany() — drizzle's `.set()` types reflect TTable's
+      // inferred shape; the action layer works with `Record<string, unknown>`.
+      const rows = await this.db
+        .update(this.table)
+        .set(setClause as never)
+        .where(where)
+        .returning();
       return (rows[0] as TDoc) ?? null;
     });
   }
@@ -1760,8 +1788,8 @@ export class SqliteRepository<TDoc extends Record<string, unknown>>
    * Plugins are not re-applied on the inner instance — hooks fire on
    * the outer repo's boundary; the inner is a pure IO layer.
    */
-  bindToTx(tx: SqliteDb): SqliteRepository<TDoc> {
-    return new SqliteRepository<TDoc>({
+  bindToTx(tx: SqliteDb): SqliteRepository<TDoc, TTable> {
+    return new SqliteRepository<TDoc, TTable>({
       db: tx,
       table: this.table,
       idField: this.idField,

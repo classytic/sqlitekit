@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-05-12
+
+### Changed — `SqliteRepository` is now generic over the concrete Drizzle table type
+
+`SqliteRepository<TDoc, TTable extends SQLiteTable = SQLiteTable>` and `SqliteRepositoryOptions<TTable extends SQLiteTable = SQLiteTable>` now thread the concrete `sqliteTable(...)` return type through to the `table` field. Drizzle's `SQLiteTable<TableConfig>` is generic-invariant, so the previous bare `SQLiteTable` forced callers to widen at the boundary and lose column-shape inference. With `TTable` defaulted to `SQLiteTable`, existing call sites stay backward-compatible while typed callers retain the full `SQLiteTableWithColumns<...>` shape on `repo.table`. (`src/repository/repository.ts`)
+
+## [0.3.2] - 2026-05-08
+
+### Added — `findAll(filter, { limit })` honours a driver-level cap
+
+`FindAllOptions.limit` now forwards through to the underlying Drizzle `.limit(...)` builder. Treats `0` / negative as "no limit" so callers can pass `options.limit ?? undefined` without a guard. Hooks may override via `context['limit']`. (`src/actions/read.ts`, `src/repository/repository.ts:findAll`)
+
+## [0.3.1] - 2026-05-07
+
+### Added — SQLite `LockAdapter` for distributed leasing
+
+`createSqliteLockAdapter({ driver, bootstrap? })` implements the `LockAdapter` contract from `@classytic/repo-core/lock`. Works against any `SqliteDriver` (better-sqlite3, expo-sqlite, libsql, D1). Uses `INSERT ... ON CONFLICT(name) DO UPDATE WHERE expires_at < ? OR holder = ?` for the acquire primitive — single-statement, no race window. `acquired_at` is preserved across same-holder extensions for diagnostics, matching the Mongo + memory adapters.
+
+Table named `kit_locks` (SQLite reserves the `sqlite_` namespace). `bootstrap: true` runs `CREATE TABLE IF NOT EXISTS` eagerly; default is lazy. Hosts managing schema externally pass `bootstrap: false`. Clock-skew caveat documented in source — replicas MUST NTP-sync within `leaseMs`, same constraint as Redlock / Etcd leases. New subpath export: `@classytic/sqlitekit/lock`. (`src/lock/index.ts`)
+
 ## [0.3.0] - 2026-05-04
 
 ### Added — SCIM 2.0 PUT / PATCH support
