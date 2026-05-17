@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-17
+
+### Added — `purgeByField` (compliance-grade tenant cleanup)
+
+- **`SqliteRepository.purgeByField(field, value, strategy, options)`** implements `StandardRepo.purgeByField` from `@classytic/repo-core` 0.5.0. Cross-kit parity with mongokit 3.14.0 — same call signature, same behavior contract.
+- **Hexagonal split**: `runChunkedPurge` orchestrator lives in repo-core (kit-agnostic); sqlitekit ships only the `PurgePort` adapter (`src/actions/purge.ts`).
+- **Per-strategy round-trip optima** (better than mongokit on `hard` because SQLite supports the subquery shape):
+  - `hard` — single statement: `DELETE FROM t WHERE id IN (SELECT id FROM t WHERE field = ? LIMIT n) RETURNING id`. **1 round-trip per chunk** (vs 2 with SELECT-then-DELETE). Falls back gracefully on drivers without `DELETE … RETURNING` in `.all()` (libsql, D1).
+  - `soft` — same subquery shape with `UPDATE … SET deleted = 1, deletedAt = ?`. 1 RT when the driver supports `UPDATE … RETURNING`; 2 RTs fallback.
+  - `anonymize` (static fields) — SELECT ids + `updateMany` via the routed Repository method (audit + cache plugins compose).
+  - `anonymize` (function-form replacers) — fetch docs + per-row `UPDATE` inside one `db.transaction()`. On `better-sqlite3` this is one logical write; on libsql/D1 the N statements bundle into one network round-trip.
+- **9 conformance scenarios pass** in `tests/integration/conformance.test.ts` (lockstep with mongokit's `purgeByField` behavior).
+
+### Peer-dep range
+
+- `@classytic/repo-core` peer bumped from `^0.4.2` → `^0.5.0`.
+
 ## [0.3.3] - 2026-05-12
 
 ### Changed — `SqliteRepository` is now generic over the concrete Drizzle table type
