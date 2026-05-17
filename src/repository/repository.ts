@@ -46,9 +46,16 @@ import type {
   MinimalRepo,
   PaginationParams,
   QueryOptions,
+  TenantPurgeOptions,
+  TenantPurgeResult,
+  TenantPurgeStrategy,
   WriteOptions,
 } from '@classytic/repo-core/repository';
-import { RepositoryBase, type RepositoryBaseOptions } from '@classytic/repo-core/repository';
+import {
+  RepositoryBase,
+  type RepositoryBaseOptions,
+  runChunkedPurge,
+} from '@classytic/repo-core/repository';
 import {
   compileUpdateSpecToSql,
   isUpdatePipeline,
@@ -69,6 +76,7 @@ import * as deleteActions from '../actions/delete.js';
 import { type ExplainRow, explain as explainAction } from '../actions/explain.js';
 import { executeLookup } from '../actions/lookup/index.js';
 import { buildPrepared, type PreparedBuilder, type PreparedHandle } from '../actions/prepared.js';
+import { createSqlitePurgePort } from '../actions/purge.js';
 import * as readActions from '../actions/read.js';
 import * as updateActions from '../actions/update.js';
 import { type BatchItem, type RepoBatchBuilder, withBatch } from '../batch/batch.js';
@@ -1394,6 +1402,23 @@ export class SqliteRepository<
     const envelope = { acknowledged: true as const, deletedCount };
     await this._emitAfter('deleteMany', context, envelope);
     return envelope;
+  }
+
+  /**
+   * Compliance-grade cleanup primitive — see `StandardRepo.purgeByField`
+   * for the cross-kit contract. Sqlitekit composes the kit-agnostic
+   * `runChunkedPurge` orchestrator with `createSqlitePurgePort` (driver
+   * glue: raw Drizzle SELECT + routed deleteMany/updateMany/update).
+   * Implementation lives in [actions/purge.ts](../actions/purge.ts).
+   */
+  async purgeByField(
+    field: string,
+    value: unknown,
+    strategy: TenantPurgeStrategy,
+    options: TenantPurgeOptions = {},
+  ): Promise<TenantPurgeResult> {
+    const port = createSqlitePurgePort(this, field, value);
+    return runChunkedPurge(strategy, options, port);
   }
 
   async upsert(data: Partial<TDoc>, options: WriteOptions = {}): Promise<TDoc> {

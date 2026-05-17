@@ -66,6 +66,10 @@ const harness: ConformanceHarness<ConformanceDoc> = {
     },
     getOrCreate: true,
     countAndExists: true,
+    // Compliance-grade tenant cleanup primitive. Sqlitekit chunks via
+    // raw Drizzle SELECT into deleteMany/updateMany so audit + cache
+    // plugins compose. See actions/purge.ts.
+    purgeByField: true,
   },
   async setup() {
     const db: TestDb = await makeFixtureDb();
