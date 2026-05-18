@@ -94,12 +94,15 @@ const QUERY_OPS = [
   'deleteMany',
   // Field-grade/read primitives with `context.query` policy scope.
   // `claim` / `claimVersion` build CAS filters, `cursor` accepts a
-  // positional filter, and `aggregate` merges policy scope into its
-  // pre-aggregate filter.
+  // positional filter, `aggregate` merges policy scope into its
+  // pre-aggregate filter, and `aggregatePipeline` exposes the compiled
+  // scope to the host's raw-Drizzle callback (so the host AND-merges
+  // it into their WHERE explicitly — see `SqlPipelineContext.scope`).
   'claim',
   'claimVersion',
   'cursor',
   'aggregate',
+  'aggregatePipeline',
 ] as const;
 
 const LIST_OPS = ['getAll', 'aggregatePaginate', 'lookupPopulate'] as const;

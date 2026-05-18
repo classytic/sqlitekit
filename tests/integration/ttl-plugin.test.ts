@@ -191,6 +191,39 @@ describe('ttlPlugin — sweepExpired() (env-agnostic manual prune)', () => {
   });
 });
 
+describe('ttlPlugin — construction-time validation', () => {
+  it('refuses an `expireAfterSeconds` that is not a non-negative integer', () => {
+    // SQL-injection defense in depth — TS types this as `number`, but a
+    // host destructuring from JSON config could smuggle a string, float,
+    // NaN, or a string carrying a SQL fragment.
+    expect(() =>
+      // biome-ignore lint/suspicious/noExplicitAny: testing runtime defense against a smuggled non-number; `unknown` won't reach the call.
+      ttlPlugin({ field: 'expiresAt', expireAfterSeconds: '3600' as any }),
+    ).toThrow(/non-negative integer/);
+    expect(() => ttlPlugin({ field: 'expiresAt', expireAfterSeconds: -1 })).toThrow(
+      /non-negative integer/,
+    );
+    expect(() => ttlPlugin({ field: 'expiresAt', expireAfterSeconds: 1.5 })).toThrow(
+      /non-negative integer/,
+    );
+    expect(() => ttlPlugin({ field: 'expiresAt', expireAfterSeconds: Number.NaN })).toThrow(
+      /non-negative integer/,
+    );
+    expect(() =>
+      ttlPlugin({ field: 'expiresAt', expireAfterSeconds: Number.POSITIVE_INFINITY }),
+    ).toThrow(/non-negative integer/);
+    // Valid values stay valid:
+    expect(() => ttlPlugin({ field: 'expiresAt', expireAfterSeconds: 0 })).not.toThrow();
+    expect(() => ttlPlugin({ field: 'expiresAt', expireAfterSeconds: 3600 })).not.toThrow();
+  });
+
+  it('refuses a non-identifier `field` (pre-existing — locks the contract)', () => {
+    expect(() => ttlPlugin({ field: 'expires-at' })).toThrow(/invalid/i);
+    expect(() => ttlPlugin({ field: '1col' })).toThrow(/invalid/i);
+    expect(() => ttlPlugin({ field: 'expires; DROP TABLE x' })).toThrow(/invalid/i);
+  });
+});
+
 describe('createTtlPartialIndex — DDL helper', () => {
   let db: TestDb;
 

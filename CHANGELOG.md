@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-05-18
+
+### Hardened — `ttlPlugin` construction-time validation + trigger-mode docs
+
+- **Runtime guard on `expireAfterSeconds`** — TypeScript types the field as `number`, but a host destructuring from JSON config / env without coercion could smuggle a string (`"3600"` — SQLite is permissive, would silently work), a float (truncated), `NaN` / `Infinity` (corrupts the predicate), or a string carrying a SQL fragment. The value interpolates into `datetime(col, '+N seconds')` — non-integers are now refused at plugin construction with a clear error. Belt-and-braces over the TS-only defense. (`src/plugins/ttl/index.ts`)
+- **Trigger-mode footguns loudly documented** in the plugin's top-of-file JSDoc:
+  1. **Transaction coupling.** The `AFTER INSERT` trigger runs inside the originating statement's transaction. If the prune `DELETE` fails (lock contention, busy timeout, FK `ON DELETE RESTRICT` on a child table), the caller's `INSERT` rolls back — they see a write failure for a reason unrelated to their write. SQLite has no `EXCEPTION` block to swallow this. Reach for trigger mode only when (a) the table has no FK children pointing at it, AND (b) writers tolerate spurious retries. Scheduled mode isolates failure cleanly.
+  2. **Per-insert table scan without `createTtlPartialIndex`.** The trigger's `DELETE FROM t WHERE <expired>` re-evaluates the predicate against every row on every insert — O(N) per write. The partial-index helper exists but is intentionally manual: it requires the TTL column to be NULL-able (SQLite optimizes `WHERE col IS NOT NULL` away on `NOT NULL` columns) AND DDL ownership is a host concern (same stance as vacuum / FTS5 / view registration). Wire it explicitly in your migration and verify with `EXPLAIN QUERY PLAN`. Trigger mode without the partial index is the most common production regression.
+
+No runtime behavior change for hosts using `ttlPlugin` correctly today. Test coverage added in `tests/integration/ttl-plugin.test.ts` ("ttlPlugin — construction-time validation").
+
+### Added — `aggregatePipeline(build, options)` kit-native escape hatch
+
+Counterpart to mongokit's `aggregatePipeline(stages)`. Lets hosts drop down to raw Drizzle (CTEs, window functions, lateral subqueries, `json_group_array`, FTS5 — anything the portable `aggregate(req)` IR doesn't express) while keeping the plugin pipeline active.
+
+The callback receives a `SqlPipelineContext` with `{ db, table, scope, scopeRecord }`. The `scope` field is a `SQL` fragment carrying the resolved policy predicates (multi-tenant + soft-delete + any `before:aggregatePipeline` hook). Host AND-merges it into their WHERE: `.where(and(scope, customCondition))`.
+
+```ts
+const rows = await orderRepo.aggregatePipeline(({ db, table, scope }) =>
+  db
+    .select({
+      customerId: table.customerId,
+      customerName: customers.name,
+      total: sql<number>`SUM(${table.amount})`,
+    })
+    .from(table)
+    .leftJoin(customers, eq(customers.id, table.customerId))
+    .where(and(scope, eq(table.status, 'paid')))
+    .groupBy(table.customerId, customers.name)
+    .all(),
+);
+```
+
+**Why explicit `scope` (vs auto-inject)** — Drizzle's typed query builder doesn't expose enough metadata to safely splice a `WHERE` post-hoc without losing column-projection types. The host MUST `AND` in `scope`; forgetting is the SQL equivalent of calling `Model.aggregate(stages)` directly on mongoose (bypasses every plugin). The boundary stays visible at the call site by design. When no policies are active, `scope` evaluates to `1 = 1` (no-op AND), so host code stays uniform regardless of plugin configuration.
+
+The operation is registered in `SQLITE_OP_REGISTRY` with `policyKey: 'query'`. Both `multiTenantPlugin` and `softDeletePlugin` participate — they write into `context.query`, and the runtime compiles it via `compileFilterToDrizzle` before handing the fragment to the callback. Same shape future pgkit will use (only the `db` / `table` types change per kit).
+
+Cross-kit position: still kit-native (NOT on `StandardRepo<TDoc>`) — mongokit's pipeline takes `PipelineStage[]`, sqlitekit's takes a Drizzle builder callback. Same conceptual role, different signatures. Hosts targeting cross-kit portability stay on `aggregate(req: AggRequest)`.
+
 ## [0.4.0] - 2026-05-17
 
 ### Added — `purgeByField` (compliance-grade tenant cleanup)

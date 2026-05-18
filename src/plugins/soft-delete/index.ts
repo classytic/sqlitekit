@@ -53,6 +53,12 @@ const DEFAULT_READS: readonly string[] = [
   // here too. Without this, migrations that iterate via `cursor` see
   // soft-deleted rows.
   'cursor',
+  // Kit-native escape hatch — the host receives `scope` (a SQL
+  // fragment) and AND-merges it into their WHERE. The tombstone
+  // predicate joins multi-tenant + anything-else into that fragment,
+  // so the host's `where(and(scope, ...))` filter soft-deleted rows
+  // automatically (no special-case on the host side).
+  'aggregatePipeline',
 ];
 
 export function softDeletePlugin(options: SoftDeleteOptions = {}): Plugin {

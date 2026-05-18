@@ -20,6 +20,36 @@
  *     reads dominate (the trigger never fires) or when the table is
  *     huge (each insert scans for expired rows).
  *
+ *     **Two trigger-mode footguns you MUST know about:**
+ *
+ *     1. **Transaction coupling.** SQLite triggers run inside the
+ *        originating statement's transaction. If the prune `DELETE`
+ *        fails (lock contention, busy timeout, FK `ON DELETE RESTRICT`
+ *        on a child table), the caller's `INSERT` **rolls back** — they
+ *        see a write failure for a reason that has nothing to do with
+ *        their write. SQLite has no `EXCEPTION` block to swallow this.
+ *        Reach for trigger mode only when (a) the table has no FK
+ *        children pointing at it, AND (b) writers are tolerant of
+ *        spurious retries. Scheduled mode isolates failure cleanly —
+ *        prefer it for tables with referential complexity.
+ *
+ *     2. **Per-insert table scan without an index.** The trigger's
+ *        `DELETE FROM t WHERE <expired>` re-evaluates the predicate
+ *        against every row on every insert. For an N-row table that's
+ *        O(N) per write — fine at 10K rows, brutal at 10M. The plugin
+ *        ships `createTtlPartialIndex({ table, field })` for the
+ *        partial-index mitigation, but does NOT auto-create the index.
+ *        Two reasons it's manual: (a) partial indexes require the TTL
+ *        column to be NULL-able in the schema (SQLite optimizes
+ *        `WHERE col IS NOT NULL` away when the column is `NOT NULL`),
+ *        and the plugin can't introspect that; (b) DDL ownership is
+ *        a host decision — same surface as `vacuum` / FTS5 / view
+ *        registration (see sqlitekit's "Index Management" stance).
+ *        Wire `createTtlPartialIndex` explicitly in your migration
+ *        and verify with `EXPLAIN QUERY PLAN`. Trigger mode without
+ *        the partial index is the most common production regression
+ *        we see.
+ *
  *   - **`'lazy'`** — never deletes. Injects `<field> > now()` into
  *     every read so expired rows are invisible. Storage grows
  *     monotonically; pair with periodic `VACUUM` and a maintenance
@@ -116,6 +146,19 @@ export function ttlPlugin(options: TtlOptions): Plugin {
     );
   }
   const expireAfterSeconds = options.expireAfterSeconds ?? 0;
+  // Runtime guard — `expireAfterSeconds` lands inside `datetime(col, '+N
+  // seconds')` interpolation. TypeScript types it as `number`, but a
+  // host destructuring from JSON config / env without coercion could
+  // smuggle a string (`"3600"` — SQLite is permissive, works), a float
+  // (silently truncated), NaN / Infinity (corrupt predicate), or worse
+  // a string with a SQL fragment (would compile + execute). Cheap belt-
+  // and-braces — refuses anything that isn't a non-negative integer.
+  if (!Number.isInteger(expireAfterSeconds) || expireAfterSeconds < 0) {
+    throw new Error(
+      `[ttl] expireAfterSeconds must be a non-negative integer (got: ${String(expireAfterSeconds)}). ` +
+        `The value is interpolated into SQL — non-integers are refused as defense-in-depth.`,
+    );
+  }
   const mode = options.mode ?? 'scheduled';
   const intervalMs = options.intervalMs ?? DEFAULT_INTERVAL_MS;
   const filterReads = options.filterReads ?? DEFAULT_READS;
