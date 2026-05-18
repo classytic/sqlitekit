@@ -58,8 +58,35 @@ Like mongokit, misses return `null` or `{ success: false }` by default. Legacy t
 | `findAll` | `[]` |
 | `update`, `delete` | `null` / `{ success: false }` |
 | `count`, `exists` | `0` / `null` |
+| `aggregate(req)` | portable IR, cross-kit byte-stable |
+| `aggregatePipeline(build)` | kit-native escape hatch — see below |
+| `purgeByField(field, value, strategy)` | compliance cleanup |
 | `withTransaction` | tx-bound repo |
 | `batch` / `withBatch` | optimized write |
+
+### `aggregatePipeline(build, options)` — raw Drizzle with policy scope (0.5+)
+
+Drop-down to driver-native power (CTEs, window functions, lateral subqueries, FTS5, `json_group_array`) while keeping multi-tenant + soft-delete plugins active. Counterpart to mongokit's `aggregatePipeline(stages)`.
+
+```ts
+import { and, eq, sql } from 'drizzle-orm';
+
+const rows = await orderRepo.aggregatePipeline(({ db, table, scope }) =>
+  db.select({
+      customerId: table.customerId,
+      total: sql<number>`SUM(${table.amount})`,
+    })
+    .from(table)
+    .leftJoin(customers, eq(customers.id, table.customerId))
+    .where(and(scope, eq(table.status, 'paid')))   // ← scope MUST be AND'd in
+    .groupBy(table.customerId)
+    .all(),
+);
+```
+
+Callback receives `{ db, table, scope, scopeRecord }`. `scope` is a `SQL` fragment with the resolved policy predicates (multi-tenant + soft-delete + any `before:aggregatePipeline` hook). When no plugins are active, `scope` is `1 = 1` — always safe to AND.
+
+**Forgetting `scope` bypasses every policy plugin** — same trap as `Model.aggregate(stages)` directly on mongoose. The boundary stays visible at the call site by design; Drizzle's typed builder can't safely splice WHERE post-hoc without losing column-projection types.
 
 ## Plugins
 Order matters: POLICY → CACHE → OBSERVABILITY → DEFAULT

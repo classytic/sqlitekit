@@ -62,7 +62,15 @@ import {
   isUpdateSpec,
   type UpdateInput,
 } from '@classytic/repo-core/update';
-import { asc, desc, and as drizzleAnd, getTableColumns, getTableName, sql } from 'drizzle-orm';
+import {
+  asc,
+  desc,
+  and as drizzleAnd,
+  getTableColumns,
+  getTableName,
+  type SQL,
+  sql,
+} from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
 import {
   countAggGroups,
@@ -195,6 +203,52 @@ export interface SqliteQueryOptions extends QueryOptions {
   filter?: Filter;
   /** Sort spec: column-name → 'ASC' | 'DESC'. */
   orderBy?: Record<string, 'ASC' | 'DESC'>;
+}
+
+/**
+ * Context passed to `SqliteRepository.aggregatePipeline`'s build callback.
+ * Carries the live Drizzle handle + the resolved policy `scope` so the host
+ * can compose any SQL shape (CTEs, window functions, joins, raw `sql`) while
+ * keeping multi-tenant / soft-delete / `before:*` policy hooks active.
+ *
+ * **Cross-kit parallel.** mongokit's `aggregatePipeline(stages)` prepends a
+ * `$match` for the host; SQL's typed query builders can't safely splice a
+ * WHERE post-hoc, so sqlitekit hands the host the scope fragment and they
+ * `and(scope, ...)` it into their `WHERE`. Future pgkit will use the
+ * identical `SqlPipelineContext` shape — the only thing that changes per
+ * kit is the `db` / `table` types (pg-flavored Drizzle).
+ */
+export interface SqlPipelineContext {
+  /**
+   * Drizzle database handle. Supports the full builder (`db.select()`,
+   * `db.with()`, `db.run(sql\`...\`)`, `db.transaction()`).
+   */
+  readonly db: SqliteDb;
+  /**
+   * The repository's base table. Use directly in `.from(table)` /
+   * `.leftJoin(other, eq(other.id, table.fkId))` / column references.
+   */
+  readonly table: SQLiteTable;
+  /**
+   * Policy WHERE fragment — multi-tenant + soft-delete predicates +
+   * anything a `before:aggregatePipeline` hook wrote, pre-compiled.
+   *
+   * **Must be AND-merged into your WHERE clause:**
+   * `.where(and(scope, customCondition))`. Forgetting `scope` bypasses
+   * every policy plugin — same shape as calling `Model.aggregate(stages)`
+   * directly on mongoose. When no policies are active the fragment is
+   * `1 = 1` (no-op AND), so the host's call stays uniform regardless
+   * of plugin configuration.
+   */
+  readonly scope: SQL;
+  /**
+   * Same policy as a plain record (`{ organizationId: 'org_123', deletedAt: null }`),
+   * available when the policy reached the context as a record rather
+   * than a Filter IR node. Use when your query shape needs field-keyed
+   * access (`Object.entries(scopeRecord).map(...)`). Empty `{}` when
+   * the policy is Filter-IR-only — fall back to `scope` in that case.
+   */
+  readonly scopeRecord: Record<string, unknown>;
 }
 
 /**
@@ -1494,6 +1548,112 @@ export class SqliteRepository<
       );
       return { rows };
     });
+  }
+
+  /**
+   * Kit-native escape hatch — host writes raw Drizzle (CTEs, window
+   * functions, lateral subqueries, `json_group_array`, FTS5, anything
+   * the portable `aggregate(req)` IR doesn't express) and the runtime
+   * threads the policy `scope` (multi-tenant + soft-delete + any other
+   * `before:*` predicate plugin) into the callback. **Counterpart to
+   * mongokit's `aggregatePipeline(stages)`** — different signature
+   * (Drizzle's typed builder vs Mongo's stage array) but the same role:
+   * "drop down to driver-native power while keeping plugins active."
+   *
+   * **Scope is explicit, not auto-injected.** Drizzle's typed query
+   * builder doesn't expose enough metadata to splice a `WHERE` post-hoc
+   * without losing column-projection types. The host gets a `scope`
+   * `SQL` fragment carrying the resolved policy predicates and MUST
+   * `AND` it into their `WHERE` clause:
+   *
+   *   `.where(and(scope, customCondition))`
+   *
+   * Forgetting `scope` is the SQL equivalent of calling
+   * `Model.aggregate(stages)` directly in mongoose — bypasses every
+   * plugin. The boundary is visible at the call site by design.
+   *
+   * When no policies are active (no multi-tenant plugin, no
+   * soft-delete, etc.) `scope` evaluates to `1 = 1` — always safe to
+   * `AND` in. Host code stays uniform regardless of plugin config.
+   *
+   * Reach for `aggregate(req)` first (portable, conformance-tested,
+   * works on every kit). Drop here only when you need a sqlite-specific
+   * construct.
+   *
+   * @example Cross-table aggregation with policy scope
+   * ```ts
+   * import { and, eq, sql } from 'drizzle-orm';
+   * import { customers } from './schema';
+   *
+   * const rows = await orderRepo.aggregatePipeline(({ db, table, scope }) =>
+   *   db
+   *     .select({
+   *       customerId: table.customerId,
+   *       customerName: customers.name,
+   *       total: sql<number>`SUM(${table.amount})`,
+   *     })
+   *     .from(table)
+   *     .leftJoin(customers, eq(customers.id, table.customerId))
+   *     .where(and(scope, eq(table.status, 'paid')))     // ← scope MUST be here
+   *     .groupBy(table.customerId, customers.name)
+   *     .all(),
+   * );
+   * ```
+   *
+   * @example Recursive CTE (sqlite-specific feature)
+   * ```ts
+   * const tree = await categoryRepo.aggregatePipeline(({ db, table, scope }) =>
+   *   db.run(sql`
+   *     WITH RECURSIVE descendants AS (
+   *       SELECT * FROM ${table} WHERE parent_id IS NULL AND ${scope}
+   *       UNION ALL
+   *       SELECT c.* FROM ${table} c
+   *       INNER JOIN descendants d ON c.parent_id = d.id
+   *       WHERE ${scope}
+   *     )
+   *     SELECT * FROM descendants
+   *   `),
+   * );
+   * ```
+   */
+  async aggregatePipeline<TRow = unknown>(
+    build: (ctx: SqlPipelineContext) => PromiseLike<readonly TRow[]> | readonly TRow[],
+    options: QueryOptions = {},
+  ): Promise<TRow[]> {
+    const context = await this._buildContext('aggregatePipeline', { ...options });
+    return this._runOp('aggregatePipeline', context, async () => {
+      const ctx = this.#derivePipelineContext(context);
+      const result = await build(ctx);
+      return Array.from(result);
+    });
+  }
+
+  /**
+   * Compile the resolved policy context (multi-tenant scope, soft-delete
+   * predicate, anything a `before:aggregatePipeline` hook wrote) into a
+   * `SqlPipelineContext` for the host's callback.
+   *
+   * Hoisted because the logic is non-trivial:
+   *   - `context.query` may be a Filter IR node OR a plain record.
+   *   - `compileFilterToDrizzle` can legitimately return `undefined`
+   *     (empty predicate). We normalize to `sql\`1 = 1\`` so the host's
+   *     `and(scope, ...)` always works regardless of plugin config.
+   *   - `scopeRecord` is the record-shaped form for hosts whose
+   *     query shape needs field-keyed access. Empty `{}` when the
+   *     policy is Filter-IR-only.
+   */
+  #derivePipelineContext(context: RepositoryContext): SqlPipelineContext {
+    const policy = context.query as Filter | Record<string, unknown> | undefined;
+    const compiled = policy
+      ? compileFilterToDrizzle(this.#asFilter(policy), this.table)
+      : undefined;
+    const scope: SQL = compiled ?? sql`1 = 1`;
+    // Record form only when the policy was already a plain record. Filter IR
+    // can't round-trip to a record cleanly (compound `and(or(...),...)` etc.),
+    // so we emit `{}` in that case — host uses `scope` instead.
+    const scopeRecord: Record<string, unknown> =
+      policy && !isFilter(policy) ? (policy as Record<string, unknown>) : {};
+    return { db: this.db, table: this.table, scope, scopeRecord };
   }
 
   /**

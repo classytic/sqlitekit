@@ -17,4 +17,5 @@ export {
   type SqliteQueryOptions,
   SqliteRepository,
   type SqliteRepositoryOptions,
+  type SqlPipelineContext,
 } from './repository.js';

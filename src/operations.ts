@@ -77,6 +77,15 @@ export const SQLITE_OP_REGISTRY = extendRegistry(CORE_OP_REGISTRY, {
   aggregate: { policyKey: 'query', mutates: false, hasIdContext: false },
   aggregatePaginate: { policyKey: 'filters', mutates: false, hasIdContext: false },
   lookupPopulate: { policyKey: 'filters', mutates: false, hasIdContext: false },
+  /**
+   * Kit-native escape hatch — host writes raw Drizzle (joins, CTEs,
+   * window functions, anything the portable IR doesn't express) and the
+   * runtime hands them a pre-derived `scope` SQL fragment carrying the
+   * multi-tenant + soft-delete predicates. policyKey: 'query' so the
+   * plugin pipeline writes scope into `context.query` exactly the way
+   * it does for `aggregate` / `cursor` / `claim`.
+   */
+  aggregatePipeline: { policyKey: 'query', mutates: false, hasIdContext: false },
 });
 
 /** Concrete operation-name union for sqlitekit. */
