@@ -22,7 +22,7 @@ export function columnMissing(ctx: string, field: string, table: SQLiteTable): E
 export function tableMissing(from: string): Error {
   return new Error(
     `sqlitekit/lookup: table "${from}" not found in the Drizzle schema. ` +
-      'Pass the schema registry when constructing the repository (e.g. `new SqliteRepository({ db, table, schema })`) ' +
+      'Pass the table registry when constructing the repository (e.g. `new SqliteRepository({ db, table, tables })`) ' +
       'so lookups can resolve foreign tables by name.',
   );
 }

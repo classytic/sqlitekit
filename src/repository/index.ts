@@ -10,6 +10,8 @@
  * Node adapter, Expo apps plug in their own.
  */
 
+export { SQLITEKIT_CAPABILITIES } from '../capabilities.js';
+export { type CreateRepositoryConfig, createRepository } from '../create-repository.js';
 export {
   type SqliteMiddleware,
   type SqliteMiddlewareContext,

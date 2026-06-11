@@ -30,7 +30,7 @@ import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 
-import { SqliteRepository } from '@classytic/sqlitekit/repository';
+import { createRepository } from '@classytic/sqlitekit/repository';
 import { createBetterSqlite3Driver } from '@classytic/sqlitekit/driver/better-sqlite3';
 import { productionPragmas } from '@classytic/sqlitekit/driver/pragmas';
 import { createMigrator, fromDrizzleDir } from '@classytic/sqlitekit/migrate';
@@ -44,6 +44,8 @@ const users = sqliteTable('users', {
   age: integer('age'),
   active: integer('active', { mode: 'boolean' }).notNull().default(true),
   createdAt: text('createdAt').notNull(),
+  updatedAt: text('updatedAt'),
+  deletedAt: text('deletedAt'),
 });
 
 // 2. Open the DB. Apply WAL + foreign keys + 64MB cache via the production preset.
@@ -54,11 +56,19 @@ const driver = createBetterSqlite3Driver(sqlite, { pragmas: productionPragmas() 
 const migrations = await fromDrizzleDir({ dir: './migrations' });
 await createMigrator({ driver, migrations }).up();
 
-// 4. Wire the repository to the Drizzle db + table.
+// 4. Build the repository — `createRepository` is the recommended path.
+//    Feature slots expand to plugins in the canonical safe order
+//    (multiTenant → softDelete → timestamps → cache → audit → ttl);
+//    slots you leave out are fully inert.
 const db = drizzle(sqlite, { schema: { users } });
-const repo = new SqliteRepository<typeof users.$inferSelect>({
+const repo = createRepository<typeof users.$inferSelect>({
   db,
   table: users,
+  timestamps: true,       // stamps createdAt / updatedAt
+  softDelete: true,       // delete() tombstones deletedAt; reads hide deleted rows
+  // tenant: { resolveTenantId: (ctx) => ctx.organizationId as string },
+  // schema: userCreateSchema,  // any Standard Schema validator (Zod / Valibot / ArkType)
+  // events: { transport },     // publishes `users.created`, `users.updated`, ...
 });
 
 // 5. CRUD + Filter IR.
@@ -68,12 +78,18 @@ await repo.create({
   email: 'a@example.com',
   age: 30,
   active: true,
-  createdAt: new Date().toISOString(),
 });
 
 const adults = await repo.findAll(and(gt('age', 18), eq('active', true)));
 const page = await repo.getAll({ page: 1, limit: 20, sort: '-createdAt' });
+
+// Feature-detect across kits (repo-core 0.6 contract):
+if (repo.capabilities.arrayOperators) {
+  await repo.findOneAndUpdate({ id: 'u1' }, { $push: { tags: 'vip' } });
+}
 ```
+
+`new SqliteRepository({ db, table, plugins: [...] })` remains available when you need full control over the plugin array.
 
 ## Quick start (Expo / React Native)
 
@@ -120,7 +136,7 @@ export default {
 
 | Subpath | Exports |
 |---|---|
-| `@classytic/sqlitekit/repository` | `SqliteRepository`, `SqliteRepositoryOptions`, `SqliteQueryOptions` |
+| `@classytic/sqlitekit/repository` | `createRepository`, `SqliteRepository`, `SQLITEKIT_CAPABILITIES`, `SqliteRepositoryOptions`, `SqliteQueryOptions` |
 | `@classytic/sqlitekit/batch` | `withBatch` (cross-repo atomic writes), `RepoBatchBuilder`, `BatchItem` |
 | `@classytic/sqlitekit/filter` | `compileFilterToDrizzle` (Filter IR → Drizzle predicate) |
 | `@classytic/sqlitekit/schema` | `createIndex`, `dropIndex`, `reindex`, `listIndexes`, `IndexInfo` |
@@ -194,6 +210,39 @@ const r2: MinimalRepo<User> = mongoRepo;  // ← also compiles
 The full surface includes the StandardRepo extensions: `findOneAndUpdate`, `updateMany`, `deleteMany`, `upsert`, `increment`, `aggregate`, `distinct`, `withTransaction`, `withBatch`, `isDuplicateKeyError`.
 
 Pagination result types (`OffsetPaginationResult`, `KeysetPaginationResult`, `AggregatePaginationResult`, `PaginationResult`), tenant config (`TenantConfig`, `resolveTenantConfig`), and error contracts (`HttpError`, `ErrorContract`, `toErrorContract`) all flow from `@classytic/repo-core/*` — sqlitekit re-exports nothing, hosts import directly from repo-core. `multiTenantPlugin`'s options interface `extends Pick<TenantConfig, 'tenantField' | 'contextKey' | 'required'>` from repo-core. `buildCrudSchemasFromTable` ships a compile-time `SchemaGenerator<TModel>` conformance assertion so it plugs into `createDrizzleAdapter({ schemaGenerator: buildCrudSchemasFromTable })` without casts.
+
+## JSON array operators — `$push` / `$pull` / `$addToSet` / `$pop` / `$pullAll`
+
+Mongo array update operators work on **JSON-mode TEXT columns** (`text(col, { mode: 'json' })`). Each operator compiles to a single atomic `UPDATE ... SET col = <json expression>` (`json_insert` / `json_each` rewrites — no read-modify-write), so concurrent writers compose like mongokit's native operators. Available on `findOneAndUpdate`, `updateMany`, `claim`, and `claimVersion`; multi-tenant scope, soft-delete, audit, and cache plugins all apply. Feature-detect via `repo.capabilities.arrayOperators`.
+
+```ts
+await repo.findOneAndUpdate({ id }, { $push: { tags: 'vip' } });
+await repo.findOneAndUpdate({ id }, { $push: { tags: { $each: ['a', 'b'] } } });
+await repo.findOneAndUpdate({ id }, { $addToSet: { tags: 'vip' } });        // dedup
+await repo.findOneAndUpdate({ id }, { $pull: { members: { id: 'm1' } } }); // exact-object match
+await repo.findOneAndUpdate({ id }, { $pullAll: { tags: ['a', 'b'] } });
+await repo.findOneAndUpdate({ id }, { $pop: { tags: 1 } });                // 1 = last, -1 = first
+await repo.updateMany({ status: 'open' }, { $push: { tags: 'bulk' } });
+```
+
+**Supported subset** (everything outside it throws a precise error — never a silent no-op):
+
+| Works | Throws |
+|---|---|
+| `$push` scalar / object / nested array, `$each` | `$push` modifiers `$position` / `$slice` / `$sort` |
+| `$addToSet` (dedups against stored array and within `$each`) | — |
+| `$pull` scalar, `$pull` exact-object match | `$pull` with query conditions (`{ $gt: 5 }`, `$in`, ...) |
+| `$pullAll` (list of scalars/objects) | non-array operand |
+| `$pop: 1` / `$pop: -1` | any other direction |
+
+Semantics & caveats (pinned by `tests/integration/array-operators.test.ts`):
+
+- **NULL / missing columns initialize to `[]`** before `$push` / `$addToSet`; `$pull` / `$pullAll` / `$pop` on a NULL column produce `[]`.
+- **Object matching is exact-shape.** `$pull` / `$addToSet` compare object elements by minified JSON text — same keys in a *different order* do **not** match. Round-trips through these operators (push a literal, pull the same literal) always match.
+- **Booleans re-encode as 0/1** whenever a rebuild op (`$pull` / `$pullAll` / `$pop`) rewrites the array — SQLite's `json_each` yields integers for JSON true/false. Matching still works (`$pull: { flags: true }` removes both `true` and `1`).
+- **Upserts seed the array.** `findOneAndUpdate(filter, { $push: ... }, { upsert: true })` inserts a new row whose column is the pushed value(s).
+- A column targeted by both an array operator and a flat write (`$set` / `$unset` / `$inc`), or by two array operators, throws — same conflict mongo rejects.
+- For predicate pulls (`$pull` with conditions) rewrite the array via raw Drizzle on `repo.db`.
 
 ## Atomicity primitives — `batch` vs `transaction`
 

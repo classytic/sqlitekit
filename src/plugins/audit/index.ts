@@ -14,13 +14,16 @@
  */
 
 import { HOOK_PRIORITY } from '@classytic/repo-core/hooks';
-import type { Plugin, RepositoryBase } from '@classytic/repo-core/repository';
+import type { Plugin, RepositoryBase, RetryPolicy } from '@classytic/repo-core/repository';
+import { withRetry } from '@classytic/repo-core/repository';
 
 type Context = Record<string, unknown> & {
   id?: unknown;
   data?: Record<string, unknown>;
   /** Per-call opt-out. Mirrors mongokit's `context.skipPlugins`. */
   skipPlugins?: readonly string[];
+  /** Caller's resilience knob — spread into the context by every op's options bag. */
+  retryPolicy?: RetryPolicy;
 };
 
 export type AuditOperation = 'create' | 'update' | 'delete' | 'restore' | 'findOneAndUpdate';
@@ -97,7 +100,18 @@ export function auditPlugin(options: AuditPluginOptions): Plugin {
             if (actorId !== undefined) entry.actorId = actorId;
             const orgId = options.resolveOrganizationId?.(context);
             if (orgId !== undefined) entry.organizationId = orgId;
-            await options.store.record(entry);
+            // The store write is the plugin's OWN round-trip on the
+            // user's call path — honor the caller's `retryPolicy` so a
+            // transient store failure (SQLITE_BUSY on an audit_log
+            // table) doesn't fail a mutation that already committed.
+            // `signal` is deliberately NOT forwarded: the primary write
+            // succeeded, so aborting here would silently DROP the audit
+            // record — the one outcome an audit trail must never have.
+            await withRetry(
+              () => Promise.resolve(options.store.record(entry)),
+              context.retryPolicy,
+              undefined,
+            );
           },
           { priority: HOOK_PRIORITY.OBSERVABILITY },
         );

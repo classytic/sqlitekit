@@ -29,7 +29,7 @@
 import type { RepositoryCacheHandle } from '@classytic/repo-core/cache';
 import type { RepositoryContext } from '@classytic/repo-core/context';
 import type { Filter } from '@classytic/repo-core/filter';
-import { isFilter, TRUE } from '@classytic/repo-core/filter';
+import { isFilter, recordToFilter, TRUE } from '@classytic/repo-core/filter';
 import type { OffsetPaginationResult } from '@classytic/repo-core/pagination';
 import type {
   AggPaginationRequest,
@@ -46,6 +46,8 @@ import type {
   MinimalRepo,
   PaginationParams,
   QueryOptions,
+  RepoCapabilities,
+  RetryPolicy,
   TenantPurgeOptions,
   TenantPurgeResult,
   TenantPurgeStrategy,
@@ -55,6 +57,8 @@ import {
   RepositoryBase,
   type RepositoryBaseOptions,
   runChunkedPurge,
+  throwIfAborted,
+  withRetry,
 } from '@classytic/repo-core/repository';
 import {
   compileUpdateSpecToSql,
@@ -87,60 +91,42 @@ import { buildPrepared, type PreparedBuilder, type PreparedHandle } from '../act
 import { createSqlitePurgePort } from '../actions/purge.js';
 import * as readActions from '../actions/read.js';
 import * as updateActions from '../actions/update.js';
+import {
+  compileArrayOperators,
+  hasArrayOperators,
+  MONGO_ARRAY_OPS,
+} from '../actions/update-array-ops.js';
 import { type BatchItem, type RepoBatchBuilder, withBatch } from '../batch/batch.js';
+import { SQLITEKIT_CAPABILITIES } from '../capabilities.js';
 import { compileFilterToDrizzle } from '../filter/compile.js';
-import { recordToFilter } from '../filter/from-record.js';
 import { PaginationEngine, type SortKey } from './pagination/PaginationEngine.js';
 import { withManualTransaction } from './transaction.js';
 import type { SqliteDb } from './types.js';
 
 /**
- * Mongo array operators that don't compile to flat SQLite column writes.
- * `$push` / `$pull` / `$addToSet` / `$pop` / `$pullAll` are array-aware
- * mutations on the mongo BSON model; SQLite stores arrays as JSON in TEXT
- * columns and would need `json_insert` / `json_remove` to express the
- * same semantic atomically (kit-specific work the IR doesn't yet ship).
+ * Mongo write operators we compile to SQLite column writes.
  *
- * Hosts hitting this — typically through SCIM PATCH array ops in
- * `@classytic/arc/scim` — get a clean error instead of an incoherent
- * Drizzle failure or a row write to a column literally named `$push`.
- * The SCIM plugin translates the throw into a `400 Bad Request` with
- * `scimType: invalidValue`, which is the right RFC 7644 response.
- *
- * Mirrors the refusal `claim()` ships at the same surface — same op
- * list, same error shape. Centralised here so future ops added to the
- * unsupported list propagate to every write surface at once.
- */
-const UNSUPPORTED_MONGO_ARRAY_OPS = ['$push', '$pull', '$addToSet', '$pop', '$pullAll'] as const;
-
-/**
- * Mongo write operators we DO compile to flat SQLite column writes.
  * `$set` / `$unset` / `$inc` map cleanly to UPDATE column assignments;
  * `$setOnInsert` is a no-op on a non-upsert path and ignored on the
- * UPDATE branch (it lands in the INSERT branch via `UpdateSpec`).
+ * UPDATE branch (it lands in the INSERT branch via `UpdateSpec`). The
+ * array operators (`$push` / `$pull` / `$addToSet` / `$pop` /
+ * `$pullAll`) compile to atomic `json_insert` / `json_each` SQL on
+ * JSON TEXT columns — see `actions/update-array-ops.ts` for the
+ * supported subset and its caveats.
  *
  * SCIM PATCH in `@classytic/arc/scim` produces these operator records
- * directly (`{ $set: { active: false } }`) and forwards to
- * `findOneAndUpdate`. Without this compilation step the keys land as
- * literal column names and Drizzle errors with an unhelpful SQL parse
- * error — same shape as the array-op gap, different cause.
+ * directly (`{ $set: { active: false } }`, `{ $push: { members: m } }`)
+ * and forwards to `findOneAndUpdate`. Without this compilation step the
+ * keys land as literal column names and Drizzle errors with an
+ * unhelpful SQL parse error.
  */
-const SUPPORTED_MONGO_WRITE_OPS = ['$set', '$unset', '$inc', '$setOnInsert'] as const;
-
-function rejectMongoArrayOperators(update: unknown, callerName: string): void {
-  if (!update || typeof update !== 'object' || Array.isArray(update)) return;
-  const record = update as Record<string, unknown>;
-  for (const op of UNSUPPORTED_MONGO_ARRAY_OPS) {
-    if (op in record) {
-      throw new Error(
-        `sqlitekit: ${callerName}() does not support the '${op}' operator. ` +
-          'Mongo-array operators do not compile to flat column writes — ' +
-          'use a kit-native batch operation, compose the update with `repo.db` directly, ' +
-          'or read-modify-write the JSON column at the application layer.',
-      );
-    }
-  }
-}
+const SUPPORTED_MONGO_WRITE_OPS = [
+  '$set',
+  '$unset',
+  '$inc',
+  '$setOnInsert',
+  ...MONGO_ARRAY_OPS,
+] as const;
 
 /**
  * Detect a mongo-operator record (any top-level key starts with `$`).
@@ -188,14 +174,27 @@ export interface SqliteRepositoryOptions<TTable extends SQLiteTable = SQLiteTabl
    * Map of `tableName → SQLiteTable` used by `lookupPopulate` to
    * resolve the foreign tables named in `LookupSpec.from`. Typically
    * the same Drizzle schema module the app already exports, e.g.
-   * `import * as schema from './db/schema.js'; new SqliteRepository({ db, table: schema.users, schema });`.
+   * `import * as schema from './db/schema.js'; new SqliteRepository({ db, table: schema.users, tables: schema });`.
    *
    * If you constructed your db with `drizzle(sqlite, { schema })`,
-   * sqlitekit can read that schema directly — passing `schema` here
+   * sqlitekit can read that schema directly — passing `tables` here
    * is then optional. Without either source, lookups throw a clear
    * "table not found" error pointing at the fix.
+   *
+   * Renamed from `schema` in 0.6.0 — `schema` is now the Standard
+   * Schema validation slot inherited from `RepositoryBaseOptions`.
    */
-  schema?: Record<string, SQLiteTable>;
+  tables?: Record<string, SQLiteTable>;
+  /**
+   * Driver hint for per-instance capability derivation. SQLite drivers
+   * are runtime-indistinguishable from the Drizzle handle, but their
+   * capabilities differ: Cloudflare D1 has no cross-statement
+   * transactions (`withTransaction` fails at BEGIN). Pass `'d1'` so
+   * `repo.capabilities.transactions` reports `false` and capability-
+   * aware hosts branch at boot instead of catching a runtime throw.
+   * Default: `'better-sqlite3'`-class behavior (transactions on).
+   */
+  driver?: 'better-sqlite3' | 'libsql' | 'expo' | 'bun' | 'd1';
 }
 
 /** Read-operation extensions on top of repo-core's `QueryOptions`. */
@@ -315,11 +314,18 @@ export class SqliteRepository<
   readonly pagination: PaginationEngine;
   /**
    * Foreign-table registry used by `lookupPopulate`. `undefined` when
-   * the caller didn't pass `schema` AND the underlying db wasn't
+   * the caller didn't pass `tables` AND the underlying db wasn't
    * constructed with one — lookups still work for tables Drizzle can
    * resolve via the db, but throw a clear error otherwise.
    */
-  readonly schema: Record<string, SQLiteTable> | undefined;
+  readonly tables: Record<string, SQLiteTable> | undefined;
+  /**
+   * Runtime capability flags — the `StandardRepo` feature-detection
+   * contract (repo-core ≥ 0.6.0). Derived from `SQLITEKIT_CAPABILITIES`
+   * with per-instance adjustments: a `driver: 'd1'` hint flips
+   * `transactions` off (D1 has no cross-statement transactions).
+   */
+  readonly capabilities: RepoCapabilities;
 
   /**
    * Cache handle wired by the unified `cachePlugin` from
@@ -330,7 +336,21 @@ export class SqliteRepository<
   cache?: RepositoryCacheHandle;
 
   constructor(options: SqliteRepositoryOptions<TTable>) {
-    const { plugins, hooks, pluginOrderChecks, name, table, db, idField, schema } = options;
+    const {
+      plugins,
+      hooks,
+      pluginOrderChecks,
+      onPluginOrderWarning,
+      name,
+      table,
+      db,
+      idField,
+      tables,
+      driver,
+      schema,
+      updateSchema,
+      events,
+    } = options;
     if (!table) {
       throw new Error('sqlitekit: SqliteRepository requires a Drizzle `table`');
     }
@@ -343,14 +363,26 @@ export class SqliteRepository<
     // like `ttl` need to read `repo.db` / `repo.table` during their
     // `apply()`, and those don't exist yet at super() time. Mirrors
     // mongokit's pattern of running `this.use(plugin)` post-init.
+    //
+    // `schema` / `updateSchema` / `events` forward to RepositoryBase,
+    // which wires Standard Schema validation (HOOK_PRIORITY.VALIDATION)
+    // and `<resource>.<verb>` domain-event emission automatically.
     super({
       ...(hooks !== undefined ? { hooks } : {}),
       ...(pluginOrderChecks !== undefined ? { pluginOrderChecks } : {}),
+      ...(onPluginOrderWarning !== undefined ? { onPluginOrderWarning } : {}),
+      ...(schema !== undefined ? { schema } : {}),
+      ...(updateSchema !== undefined ? { updateSchema } : {}),
+      ...(events !== undefined ? { events } : {}),
       name: name ?? tableName,
     });
     this.db = db;
     this.table = table;
-    this.schema = schema;
+    this.tables = tables;
+    // Per-instance capability derivation — D1 can't run withTransaction
+    // (no cross-statement transactions; BEGIN fails at the driver).
+    this.capabilities =
+      driver === 'd1' ? { ...SQLITEKIT_CAPABILITIES, transactions: false } : SQLITEKIT_CAPABILITIES;
 
     const columns = getTableColumns(table) as Record<string, SQLiteColumn>;
     this.columns = columns;
@@ -475,7 +507,16 @@ export class SqliteRepository<
   ): Promise<T> {
     return this._composeMiddleware(op, context, async () => {
       try {
-        const result = await fn();
+        // Retry choke point — `fn` is the driver round-trip ONLY.
+        // Before-hooks already ran in `_buildContext`, middleware wraps
+        // once around the whole retry loop, and after/error hooks fire
+        // exactly once below — so a retry NEVER re-runs validation /
+        // audit / events. `withRetry` with no policy is a zero-cost
+        // passthrough; SQLITE_BUSY is the canonical transient error
+        // this serves. `retryPolicy` / `signal` read from the context
+        // because every op spreads its options bag into `_buildContext`.
+        const { retryPolicy, signal } = this.#resilience(context);
+        const result = await withRetry(fn, retryPolicy, signal);
         await this._emitAfter(op, context, result);
         return result;
       } catch (err) {
@@ -485,7 +526,19 @@ export class SqliteRepository<
     });
   }
 
+  /** Pull the repo-core resilience knobs out of a hook context (options spread in at `_buildContext`). */
+  #resilience(context: RepositoryContext): {
+    retryPolicy: RetryPolicy | undefined;
+    signal: AbortSignal | undefined;
+  } {
+    return {
+      retryPolicy: context['retryPolicy'] as RetryPolicy | undefined,
+      signal: context['signal'] as AbortSignal | undefined,
+    };
+  }
+
   async getAll(params: PaginationParams<TDoc> = {}, options: QueryOptions = {}): Promise<unknown> {
+    throwIfAborted(options.signal);
     const context = await this._buildContext('getAll', {
       filters: params.filters,
       sort: params.sort,
@@ -543,6 +596,7 @@ export class SqliteRepository<
   }
 
   async create(data: Partial<TDoc>, options: WriteOptions = {}): Promise<TDoc> {
+    throwIfAborted(options.signal);
     const context = await this._buildContext('create', { data, ...options });
     return this._runOp('create', context, () =>
       createActions.create<TDoc>(this.db, this.table, (context.data ?? data) as Partial<TDoc>),
@@ -550,6 +604,7 @@ export class SqliteRepository<
   }
 
   async update(id: string, data: Partial<TDoc>, options: WriteOptions = {}): Promise<TDoc | null> {
+    throwIfAborted(options.signal);
     const context = await this._buildContext('update', { id, data, ...options });
     return this._runOp('update', context, () => {
       const payload = (context.data ?? data) as Partial<TDoc>;
@@ -609,17 +664,27 @@ export class SqliteRepository<
   }
 
   async delete(id: string, options: DeleteOptions = {}): Promise<DeleteResult | null> {
+    throwIfAborted(options.signal);
     const context = await this._buildContext('delete', {
       id,
       ...options,
       ...(options.mode ? { deleteMode: options.mode } : {}),
     });
     try {
+      const { retryPolicy, signal } = this.#resilience(context);
       // soft-delete plugin sets context.softDeleted + rewrites context.data
       // to carry the tombstone field. Honor it by routing through update.
       if (context['softDeleted'] === true) {
         const rewritten = context.data as Partial<TDoc> | undefined;
-        if (rewritten) await this.update(id, rewritten);
+        // Forward the resilience knobs so the tombstone UPDATE's driver
+        // call retries inside update()'s own choke point (its before-
+        // hooks run once; only the round-trip re-attempts).
+        if (rewritten) {
+          await this.update(id, rewritten, {
+            ...(retryPolicy !== undefined ? { retryPolicy } : {}),
+            ...(signal !== undefined ? { signal } : {}),
+          });
+        }
         const result: DeleteResult = {
           message: 'Soft deleted',
           id,
@@ -630,12 +695,10 @@ export class SqliteRepository<
       }
       const scope = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
       const scopeWhere = compileFilterToDrizzle(scope, this.table);
-      const removed = await deleteActions.deleteById(
-        this.db,
-        this.table,
-        this.idColumn,
-        id,
-        scopeWhere,
+      const removed = await withRetry(
+        () => deleteActions.deleteById(this.db, this.table, this.idColumn, id, scopeWhere),
+        retryPolicy,
+        signal,
       );
       const result: DeleteResult | null = removed ? { message: 'Deleted', id } : null;
       await this._emitAfter('delete', context, result);
@@ -654,6 +717,7 @@ export class SqliteRepository<
     filter: Record<string, unknown> | Filter,
     options: QueryOptions = {},
   ): Promise<TDoc | null> {
+    throwIfAborted(options.signal);
     const context = await this._buildContext('getOne', { query: filter, ...options });
     const cached = this._cachedValue<TDoc | null>(context);
     if (cached !== undefined) {
@@ -678,7 +742,12 @@ export class SqliteRepository<
     const context = await this._buildContext('count', { query: filter, ...options });
     const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
     const where = compileFilterToDrizzle(f, this.table);
-    const result = await readActions.count(this.db, this.table, where);
+    const { retryPolicy, signal } = this.#resilience(context);
+    const result = await withRetry(
+      () => readActions.count(this.db, this.table, where),
+      retryPolicy,
+      signal,
+    );
     await this._emitAfter('count', context, result);
     return result;
   }
@@ -690,7 +759,12 @@ export class SqliteRepository<
     const context = await this._buildContext('exists', { query: filter, ...options });
     const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
     const where = compileFilterToDrizzle(f, this.table);
-    const result = await readActions.exists(this.db, this.table, where);
+    const { retryPolicy, signal } = this.#resilience(context);
+    const result = await withRetry(
+      () => readActions.exists(this.db, this.table, where),
+      retryPolicy,
+      signal,
+    );
     await this._emitAfter('exists', context, result);
     return result;
   }
@@ -699,13 +773,19 @@ export class SqliteRepository<
     filter: Record<string, unknown> | Filter = {},
     options: FindAllOptions = {},
   ): Promise<TDoc[]> {
+    throwIfAborted(options.signal);
     const context = await this._buildContext('findAll', { query: filter, ...options });
     const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
     const where = compileFilterToDrizzle(f, this.table);
     // Forward optional `limit` from FindAllOptions through to the action.
     // Hooks may override via `context['limit']`; fall back to the caller's value.
     const limit = (context['limit'] as number | undefined) ?? options.limit;
-    const result = await readActions.findAll<TDoc>(this.db, this.table, where, undefined, limit);
+    const { retryPolicy, signal } = this.#resilience(context);
+    const result = await withRetry(
+      () => readActions.findAll<TDoc>(this.db, this.table, where, undefined, limit),
+      retryPolicy,
+      signal,
+    );
     await this._emitAfter('findAll', context, result);
     return result;
   }
@@ -745,16 +825,6 @@ export class SqliteRepository<
           'no equivalent to MongoDB aggregation-pipeline updates.',
       );
     }
-
-    // Refuse mongo array operators cleanly. Without this check, raw
-    // records like `{ $push: { tags: 'x' } }` fall through to
-    // `db.update(table).set({ $push: ... })` and Drizzle either errors
-    // confusingly or attempts to write a column literally named
-    // `$push`. Mirrors the refusal `claim()` already ships — same op
-    // list, same error shape. SCIM PATCH array ops in
-    // `@classytic/arc/scim` rely on this refusal to surface
-    // `scimType: invalidValue` to IdPs.
-    rejectMongoArrayOperators(update, 'findOneAndUpdate');
 
     // Route portable Update IR to a Drizzle-friendly record once. The
     // UPDATE branch uses `updateData`; the upsert INSERT branch uses
@@ -845,9 +915,10 @@ export class SqliteRepository<
    *   - `$inc: { col: n }` → `SET col = COALESCE(col, 0) + n`
    *   - `$unset: { col: '' }` → `SET col = NULL`
    *
-   * Mongo array operators (`$push` / `$pull` / `$addToSet`) don't
-   * translate cleanly to flat columns — they throw with a clear
-   * "use the kit-native batch op" error.
+   * Mongo array operators (`$push` / `$pull` / `$addToSet` / `$pop` /
+   * `$pullAll`) compile to atomic JSON SQL on JSON TEXT columns —
+   * same supported subset as `findOneAndUpdate` (see
+   * `actions/update-array-ops.ts`).
    *
    * Mixed flat + `$`-prefixed keys in the same patch throw — mongo
    * would silently drop the flat keys; same trap rule as `claimVersion`.
@@ -964,19 +1035,20 @@ export class SqliteRepository<
         }
         update[field] = sql`coalesce(${col}, 0) + ${delta}`;
       }
-      // Reject mongo array operators with a clear error — they don't
-      // translate to flat column writes. `$push` / `$pull` /
-      // `$addToSet` are mongo-array-aware operations; SQL equivalents
-      // require kit-specific JSON handling, not the column-write path
-      // claim() compiles to.
-      const unsupported = ['$push', '$pull', '$addToSet', '$pop', '$pullAll'];
-      for (const op of unsupported) {
-        if (op in patchRecord) {
-          throw new Error(
-            `sqlitekit: claim() does not support the '${op}' operator. ` +
-              'Mongo-array operators do not compile to flat column writes — ' +
-              'use a kit-native batch operation or compose the update with `repo.db` directly.',
-          );
+      // Array operators ($push / $pull / $addToSet / $pop / $pullAll)
+      // share the same atomic json_insert / json_each compiler as
+      // findOneAndUpdate / updateMany — see actions/update-array-ops.ts
+      // for the supported subset.
+      if (hasArrayOperators(patchRecord)) {
+        const compiled = compileArrayOperators(patchRecord, this.columns, getTableName(this.table));
+        for (const [field, fragment] of Object.entries(compiled.set)) {
+          if (field in update) {
+            throw new Error(
+              `sqlitekit: claim patch targets column '${field}' with both an array operator and a flat write — ` +
+                'pick one; mongo rejects the same conflict.',
+            );
+          }
+          update[field] = fragment;
         }
       }
       // Ensure the canonical state transition lands LAST.
@@ -1141,6 +1213,22 @@ export class SqliteRepository<
         }
         setData[field] = sql`coalesce(${col}, 0) + ${delta}`;
       }
+      // Array operators share the same atomic JSON compiler as
+      // findOneAndUpdate / updateMany / claim. Previously these keys
+      // were silently dropped here — now they compile (or throw for
+      // the unsupported subset).
+      if (hasArrayOperators(update)) {
+        const compiled = compileArrayOperators(update, this.columns, getTableName(this.table));
+        for (const [field, fragment] of Object.entries(compiled.set)) {
+          if (field in setData) {
+            throw new Error(
+              `sqlitekit: claimVersion update targets column '${field}' with both an array operator and a flat write — ` +
+                'pick one; mongo rejects the same conflict.',
+            );
+          }
+          setData[field] = fragment;
+        }
+      }
     } else {
       Object.assign(setData, update);
     }
@@ -1302,13 +1390,13 @@ export class SqliteRepository<
     update: UpdateInput,
     options: WriteOptions = {},
   ): Promise<{ acknowledged: true; matchedCount: number; modifiedCount: number }> {
+    throwIfAborted(options.signal);
     if (isUpdatePipeline(update)) {
       throw new Error(
         'sqlitekit: aggregation pipeline updates are not supported. ' +
           'Use an `UpdateSpec` from `@classytic/repo-core/update` or a flat column record.',
       );
     }
-    rejectMongoArrayOperators(update, 'updateMany');
     // `updateMany` has no INSERT branch — discard `insertData`.
     const { updateData } = this.#compileUpdateInput(update);
 
@@ -1324,12 +1412,18 @@ export class SqliteRepository<
         'sqlitekit: updateMany with empty filter is refused — pass an explicit Filter',
       );
     }
-    const result = await updateActions.updateMany(
-      this.db,
-      this.table,
-      this.idColumn,
-      where,
-      context.data as Record<string, unknown>,
+    const { retryPolicy, signal } = this.#resilience(context);
+    const result = await withRetry(
+      () =>
+        updateActions.updateMany(
+          this.db,
+          this.table,
+          this.idColumn,
+          where,
+          context.data as Record<string, unknown>,
+        ),
+      retryPolicy,
+      signal,
     );
     const envelope = { acknowledged: true as const, ...result };
     await this._emitAfter('updateMany', context, envelope);
@@ -1400,7 +1494,32 @@ export class SqliteRepository<
           inc: $inc,
           setOnInsert: $setOnInsert,
         };
-        return this.#compileUpdateInput(spec);
+        const base = this.#compileUpdateInput(spec);
+        if (!hasArrayOperators(record)) return base;
+
+        // Array operators ($push / $pull / $addToSet / $pop / $pullAll)
+        // compile to atomic json_insert / json_each SET expressions on
+        // JSON TEXT columns — see actions/update-array-ops.ts for the
+        // supported subset. A column targeted by BOTH an array op and a
+        // flat write ($set / $unset / $inc) is ambiguous — refuse it
+        // (mongo raises a write conflict for the same shape).
+        const compiled = compileArrayOperators(record, this.columns, getTableName(this.table));
+        for (const field of Object.keys(compiled.set)) {
+          if (field in base.updateData) {
+            throw new Error(
+              `sqlitekit: update targets column '${field}' with both an array operator and a flat write — ` +
+                'pick one; mongo rejects the same conflict.',
+            );
+          }
+        }
+        const updateData = { ...base.updateData, ...compiled.set };
+        // Upsert INSERT branch — $push / $addToSet seed the new row's
+        // array (mongo upsert parity); pull/pop ops contribute nothing.
+        const insertData =
+          Object.keys(compiled.insert).length > 0
+            ? { ...(base.insertData ?? {}), ...compiled.insert }
+            : base.insertData;
+        return { updateData, insertData };
       }
       return {
         updateData: update as Record<string, unknown>,
@@ -1444,6 +1563,7 @@ export class SqliteRepository<
     filter: Record<string, unknown> | Filter,
     options: DeleteOptions = {},
   ): Promise<{ acknowledged: true; deletedCount: number }> {
+    throwIfAborted(options.signal);
     const context = await this._buildContext('deleteMany', { query: filter, ...options });
     const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
     const where = compileFilterToDrizzle(f, this.table);
@@ -1452,7 +1572,12 @@ export class SqliteRepository<
         'sqlitekit: deleteMany with empty filter is refused — pass an explicit Filter',
       );
     }
-    const deletedCount = await deleteActions.deleteMany(this.db, this.table, this.idColumn, where);
+    const { retryPolicy, signal } = this.#resilience(context);
+    const deletedCount = await withRetry(
+      () => deleteActions.deleteMany(this.db, this.table, this.idColumn, where),
+      retryPolicy,
+      signal,
+    );
     const envelope = { acknowledged: true as const, deletedCount };
     await this._emitAfter('deleteMany', context, envelope);
     return envelope;
@@ -1478,7 +1603,12 @@ export class SqliteRepository<
   async upsert(data: Partial<TDoc>, options: WriteOptions = {}): Promise<TDoc> {
     const context = await this._buildContext('upsert', { data, ...options });
     const payload = (context.data ?? data) as Partial<TDoc>;
-    const result = await createActions.upsert<TDoc>(this.db, this.table, this.idColumn, payload);
+    const { retryPolicy, signal } = this.#resilience(context);
+    const result = await withRetry(
+      () => createActions.upsert<TDoc>(this.db, this.table, this.idColumn, payload),
+      retryPolicy,
+      signal,
+    );
     await this._emitAfter('upsert', context, result);
     return result;
   }
@@ -1542,9 +1672,9 @@ export class SqliteRepository<
         finalReq,
         // Forward the foreign-table registry so `req.lookups` can
         // resolve `LookupSpec.from` to a Drizzle table. Same source
-        // `lookupPopulate` reads — explicit `schema` wins, db's
+        // `lookupPopulate` reads — explicit `tables` wins, db's
         // `fullSchema` is the fallback inside executeAgg.
-        this.schema !== undefined ? { schema: this.schema } : {},
+        this.tables !== undefined ? { schema: this.tables } : {},
       );
       return { rows };
     });
@@ -1745,7 +1875,7 @@ export class SqliteRepository<
     useKeyset: boolean,
     limit: number,
   ): Promise<OffsetPaginationResult<TRow> | KeysetAggPaginationResult<TRow>> {
-    const aggOpts = this.schema !== undefined ? { schema: this.schema } : {};
+    const aggOpts = this.tables !== undefined ? { schema: this.tables } : {};
 
     // ── Keyset path ─────────────────────────────────────────────
     if (useKeyset) {
@@ -1833,7 +1963,7 @@ export class SqliteRepository<
    * escape (`repo.db` raw Drizzle) when you need that.
    *
    * Requires the foreign tables to be reachable via the repo's `schema`
-   * registry — passed through `new SqliteRepository({ ..., schema })`
+   * registry — passed through `new SqliteRepository({ ..., tables })`
    * or auto-discovered when the db itself was constructed with
    * `drizzle(sqlite, { schema })`. Tables not in the registry surface
    * a clear error pointing at the fix.
@@ -1880,7 +2010,7 @@ export class SqliteRepository<
         db: this.db,
         baseTable: this.table,
         basePkColumns: [this.idColumn],
-        ...(this.schema !== undefined ? { schema: this.schema } : { schema: undefined }),
+        ...(this.tables !== undefined ? { schema: this.tables } : { schema: undefined }),
         ...(filter !== undefined ? { filter } : { filter: undefined }),
         options,
       });
@@ -1890,10 +2020,15 @@ export class SqliteRepository<
   async distinct<T = unknown>(
     field: string,
     filter: Record<string, unknown> | Filter = {},
+    options: QueryOptions = {},
   ): Promise<T[]> {
     const f = this.#asFilter(filter);
     const where = compileFilterToDrizzle(f, this.table);
-    return readActions.distinct<T>(this.db, this.table, this.#col(field), where);
+    return withRetry(
+      () => readActions.distinct<T>(this.db, this.table, this.#col(field), where),
+      options.retryPolicy,
+      options.signal,
+    );
   }
 
   /**
@@ -1980,7 +2115,7 @@ export class SqliteRepository<
       idField: this.idField,
       name: this.modelName,
       pluginOrderChecks: 'off',
-      ...(this.schema ? { schema: this.schema } : {}),
+      ...(this.tables ? { tables: this.tables } : {}),
     });
   }
 

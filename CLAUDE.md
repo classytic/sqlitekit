@@ -50,7 +50,7 @@ Sqlitekit ships the same `aggregate(req: AggRequest)` surface as mongokit. Cross
 The conformance suite gates each via `features.aggregateOps.*`. If you ship a new op:
 1. Add IR type in `@classytic/repo-core/repository`
 2. Add flag to `AggregateOpsSupport`
-3. Update `tests/integration/conformance.test.ts` `features.aggregateOps` to declare your support
+3. Update `SQLITEKIT_CAPABILITIES` in `src/capabilities.ts` — it is the single source of truth; the conformance harness (`tests/integration/conformance.test.ts`) spreads it as its `features` declaration AND it ships at runtime as `repo.capabilities`
 4. If unsupported: throw `"sqlitekit/aggregate: '<op>' op is not supported on SQLite"` from `compileMeasure` — never silently ignore
 
 ### Top-N is JS post-processing, not SQL window functions

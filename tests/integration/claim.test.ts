@@ -422,10 +422,11 @@ describe('SqliteRepository.claim — atomic CAS state transition', () => {
       expect(claimed?.workerId).toBeNull();
     });
 
-    it('throws a clear error on mongo-array operators ($push)', async () => {
-      // Mongo array operators don't compile to flat column writes —
-      // claim() throws with a clear "use kit-native batch op" error
-      // rather than silently no-op or attempt a broken update.
+    it('compiles array operators in the patch (0.6.0) — unknown columns still throw clearly', async () => {
+      // As of 0.6.0 claim() compiles $push / $pull / $addToSet / $pop /
+      // $pullAll to atomic JSON SQL (see array-operators.test.ts for the
+      // full matrix). A patch referencing a column that doesn't exist on
+      // the table still fails loudly with the column + table name.
       const repo = new SqliteRepository<IRun>({ db: db.db, table: runsTable });
       const created = await repo.create(makeRun({ status: 'waiting' }));
 
@@ -433,7 +434,7 @@ describe('SqliteRepository.claim — atomic CAS state transition', () => {
         repo.claim(created.id, { from: 'waiting', to: 'running' }, {
           $push: { events: 'x' },
         } as Record<string, unknown>),
-      ).rejects.toThrow(/\$push.*kit-native/);
+      ).rejects.toThrow(/\$push references unknown column 'events' on table 'runs'/);
     });
   });
 });

@@ -12,12 +12,11 @@
  * counts non-null values in the group.
  */
 
-import type { Filter } from '@classytic/repo-core/filter';
+import { type Filter, recordToFilter } from '@classytic/repo-core/filter';
 import type { AggMeasure } from '@classytic/repo-core/repository';
 import { type SQL, sql } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
 import { compileFilterToDrizzle } from '../../filter/compile.js';
-import { recordToFilter } from '../../filter/from-record.js';
 import { columnMissing } from './errors.js';
 
 /**

@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-11
+
+Adopts the `@classytic/repo-core` 0.6.0 contract. Clean break — no deprecation aliases, no dual paths.
+
+### Added — `repo.capabilities` (runtime feature detection)
+
+`SqliteRepository` now declares `readonly capabilities: RepoCapabilities` — required by `StandardRepo` as of repo-core 0.6.0. The constant `SQLITEKIT_CAPABILITIES` (exported from `@classytic/sqlitekit/repository`) is the single source of truth: the conformance harness spreads it as its `features` declaration (`ConformanceFeatures` is now an alias of `RepoCapabilities`), so runtime flags and tested scenarios cannot drift. Pass `driver: 'd1'` at construction to derive per-instance capabilities (`transactions: false` — D1 has no cross-statement transactions).
+
+### Added — Mongo array operators on JSON TEXT columns (headline)
+
+`$push` / `$pull` / `$addToSet` / `$pop` / `$pullAll` now compile to **atomic single-statement SQL** (`json_insert` / `json_each` rewrites — no read-modify-write) on JSON-mode TEXT columns, across `findOneAndUpdate`, `updateMany`, `claim`, and `claimVersion`. Plugin/hook flow is intact — multi-tenant scope, soft-delete, audit, and cache invalidation all apply. `capabilities.arrayOperators: true`.
+
+Supported subset (see README "JSON array operators" for caveats):
+
+- `$push` scalar/object + `$each` (no `$position` / `$slice` / `$sort` — throws)
+- `$addToSet` with dedup against the stored array AND within `$each`
+- `$pull` scalar + exact-object-match (no query conditions — `$pull: { n: { $gt: 5 } }` throws)
+- `$pullAll`, `$pop: 1 | -1`
+- NULL/missing columns initialize to `[]`; the upsert INSERT branch seeds pushed values
+
+Previously these operators threw `does not support the '$push' operator` — kit-portable code using them now works on sqlitekit instead of throwing.
+
+### Added — `createRepository(config)` factory (recommended construction path)
+
+Config-driven factory exported from `@classytic/sqlitekit/repository`. Declarative feature slots (`tenant`, `softDelete`, `timestamps`, `cache`, `audit`, `ttl`) compose plugins in the canonical safe order (multiTenant → softDelete → timestamps → cache → audit → ttl) with `pluginOrderChecks: 'throw'`. Extra `plugins` append after the canonical stack. Absent slots are fully inert.
+
+### Added — `schema` / `updateSchema` / `events` construction options
+
+Forwarded to `RepositoryBase` (repo-core 0.6.0): `schema` / `updateSchema` accept any Standard Schema validator (Zod 3.24+, Valibot 1+, ArkType 2+) and validate writes at `HOOK_PRIORITY.VALIDATION` (HttpError 400 with `validationErrors` on failure); `events` accepts any arc/primitives-compatible transport and publishes `<table>.<verb>` domain events (`users.created`, ...) after every mutation. Sqlitekit has no `watch()` (`capabilities.changeStreams: false`) — `events` is the change-notification path.
+
+### Added — `QueryOptions.signal` abort guard + `retryPolicy`
+
+`create` / `update` / `delete` / `getAll` / `findAll` / `getOne` / `updateMany` / `deleteMany` call `throwIfAborted(options.signal)` at the op boundary — a cancelled request stops before the driver round-trip. `RetryPolicy` (renamed from `PurgeRetryPolicy` in repo-core) + `withRetry` are available from `@classytic/repo-core/repository`.
+
+`QueryOptions.retryPolicy` is honored on all repository operations — every op wraps its driver round-trip (only) in `withRetry`, so transient failures (canonically `SQLITE_BUSY`) back off and re-attempt while the hook lifecycle (validation, tenant scope, audit, events, middleware) runs exactly once per call; `signal` aborts between attempts.
+
+### Changed — BREAKING
+
+- **`recordToFilter` promoted to repo-core.** `src/filter/from-record.ts` deleted; the function now lives at `@classytic/repo-core/filter` (promoted verbatim — repo-core owns the unit tests). It was never a public sqlitekit export; internal imports updated, no shim.
+- **Constructor option `schema` renamed to `tables`.** The foreign-table registry for `lookupPopulate` / aggregate lookups is now `new SqliteRepository({ db, table, tables })`. The `schema` key now means a Standard Schema validator (repo-core contract) — passing the old registry shape under `schema` is a type error; rename it.
+- **Array operators no longer throw.** Code that depended on the `$push`/`$pull` refusal must adapt — the unsupported subset ($pull-with-conditions, push modifiers) still throws precise errors.
+- Peer dependency: `@classytic/repo-core` `^0.6.0`.
+
 ## [0.5.0] - 2026-05-18
 
 ### Hardened — `ttlPlugin` construction-time validation + trigger-mode docs

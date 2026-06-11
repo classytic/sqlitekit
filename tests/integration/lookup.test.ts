@@ -1,8 +1,8 @@
-/**
+﻿/**
  * Integration tests for `SqliteRepository.lookupPopulate`.
  *
  * Exercises every documented branch of the portable lookup IR against
- * a multi-table fixture (`employees` ⟶ `departments`, `employees` ⟶
+ * a multi-table fixture (`employees` âŸ¶ `departments`, `employees` âŸ¶
  * `employee_tasks`):
  *
  *   - one-to-one (`single: true`) shape with nullable miss
@@ -58,20 +58,20 @@ async function seed(db: TestDb): Promise<{
   const departments = new SqliteRepository<DepartmentRow>({
     db: db.db,
     table: departmentsTable,
-    schema: SCHEMA,
+    tables: SCHEMA,
   });
   const employees = new SqliteRepository<EmployeeWithJoins>({
     db: db.db,
     table: employeesTable,
-    schema: SCHEMA,
+    tables: SCHEMA,
   });
   const tasks = new SqliteRepository<Record<string, unknown>>({
     db: db.db,
     table: employeeTasksTable,
-    schema: SCHEMA,
+    tables: SCHEMA,
   });
 
-  // Three departments — one inactive, exercises foreign `where`.
+  // Three departments â€” one inactive, exercises foreign `where`.
   await departments.createMany([
     { id: 'd_eng', name: 'Engineering', code: 'ENG', active: true },
     { id: 'd_sales', name: 'Sales', code: 'SALES', active: true },
@@ -135,7 +135,7 @@ async function seed(db: TestDb): Promise<{
   return { employees, departments, tasks };
 }
 
-describe('lookupPopulate — one-to-one (single: true)', () => {
+describe('lookupPopulate â€” one-to-one (single: true)', () => {
   let db: TestDb;
   let employees: SqliteRepository<EmployeeWithJoins>;
 
@@ -249,7 +249,7 @@ describe('lookupPopulate — one-to-one (single: true)', () => {
   });
 });
 
-describe('lookupPopulate — one-to-many (default)', () => {
+describe('lookupPopulate â€” one-to-many (default)', () => {
   let db: TestDb;
   let employees: SqliteRepository<EmployeeWithJoins>;
 
@@ -313,7 +313,7 @@ describe('lookupPopulate — one-to-many (default)', () => {
   });
 });
 
-describe('lookupPopulate — multi-lookup composition', () => {
+describe('lookupPopulate â€” multi-lookup composition', () => {
   let db: TestDb;
   let employees: SqliteRepository<EmployeeWithJoins>;
 
@@ -393,7 +393,7 @@ describe('lookupPopulate — multi-lookup composition', () => {
   });
 });
 
-describe('lookupPopulate — base-table filter / sort / select', () => {
+describe('lookupPopulate â€” base-table filter / sort / select', () => {
   let db: TestDb;
   let employees: SqliteRepository<EmployeeWithJoins>;
 
@@ -417,7 +417,7 @@ describe('lookupPopulate — base-table filter / sort / select', () => {
         },
       ],
     });
-    expect(result.total).toBe(4); // e1, e2, e4, e5 — Carol (e3) is inactive
+    expect(result.total).toBe(4); // e1, e2, e4, e5 â€” Carol (e3) is inactive
   });
 
   it('sorts base rows by the requested column', async () => {
@@ -462,7 +462,7 @@ describe('lookupPopulate — base-table filter / sort / select', () => {
   });
 });
 
-describe('lookupPopulate — pagination', () => {
+describe('lookupPopulate â€” pagination', () => {
   let db: TestDb;
   let employees: SqliteRepository<EmployeeWithJoins>;
 
@@ -543,7 +543,7 @@ describe('lookupPopulate — pagination', () => {
   });
 });
 
-describe('lookupPopulate — validation errors', () => {
+describe('lookupPopulate â€” validation errors', () => {
   let db: TestDb;
   let employees: SqliteRepository<EmployeeWithJoins>;
 

@@ -1,14 +1,16 @@
 /**
  * Integration tests for `replace(id, doc)` + `bulkWrite([{ replaceOne }])`
- * full-replace semantics, and clean refusal of mongo array operators
- * (`$push` / `$pull` / `$addToSet` / `$pop` / `$pullAll`) on
- * `findOneAndUpdate` + `updateMany`.
+ * full-replace semantics.
  *
  * Pinned by the SCIM 2.0 PUT contract — `@classytic/arc/scim` routes
  * IdP PUT requests through `bulkWrite([{ replaceOne }])`. Earlier
  * sqlitekit versions silently coerced replace into a partial update
  * (omitted columns kept their old values), violating SCIM PUT and
  * leaving stale fields on rows IdPs intended to wholesale-replace.
+ *
+ * Mongo array operators (`$push` / `$pull` / ...) are SUPPORTED as of
+ * 0.6.0 — see `tests/integration/array-operators.test.ts` for the
+ * full suite (this file used to pin their refusal).
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -184,37 +186,7 @@ describe('bulkWrite([{ replaceOne }]) — uses replace semantics', () => {
   });
 });
 
-describe('findOneAndUpdate — refuses mongo array operators cleanly', () => {
-  let db: TestDb;
-  let repo: SqliteRepository<TestUser>;
-
-  beforeEach(async () => {
-    db = await makeFixtureDb();
-    repo = new SqliteRepository<TestUser>({ db: db.db, table: usersTable });
-    await repo.create(makeUser({ id: 'u1' }));
-  });
-
-  afterEach(() => db.close());
-
-  for (const op of ['$push', '$pull', '$addToSet', '$pop', '$pullAll'] as const) {
-    it(`refuses '${op}' with a clear, actionable error`, async () => {
-      await expect(repo.findOneAndUpdate({ id: 'u1' }, { [op]: { tags: 'x' } })).rejects.toThrow(
-        new RegExp(`sqlitekit: findOneAndUpdate\\(\\) does not support the '\\${op}' operator`),
-      );
-    });
-  }
-
-  it('still accepts $set / $unset / $inc — only array ops are refused', async () => {
-    const res = await repo.findOneAndUpdate(
-      { id: 'u1' },
-      { $set: { name: 'Set' } },
-      { returnDocument: 'after' },
-    );
-    expect(res!.name).toBe('Set');
-  });
-});
-
-describe('updateMany — refuses mongo array operators cleanly', () => {
+describe('findOneAndUpdate / updateMany — operator-record compilation still works', () => {
   let db: TestDb;
   let repo: SqliteRepository<TestUser>;
 
@@ -229,15 +201,25 @@ describe('updateMany — refuses mongo array operators cleanly', () => {
 
   afterEach(() => db.close());
 
-  for (const op of ['$push', '$pull', '$addToSet', '$pop', '$pullAll'] as const) {
-    it(`refuses '${op}' with a clear, actionable error`, async () => {
-      await expect(repo.updateMany({ role: 'reader' }, { [op]: { tags: 'x' } })).rejects.toThrow(
-        new RegExp(`sqlitekit: updateMany\\(\\) does not support the '\\${op}' operator`),
-      );
-    });
-  }
+  it('findOneAndUpdate accepts $set / $unset / $inc', async () => {
+    const res = await repo.findOneAndUpdate(
+      { id: 'u1' },
+      { $set: { name: 'Set' } },
+      { returnDocument: 'after' },
+    );
+    expect(res!.name).toBe('Set');
+  });
 
-  it('still accepts $set on every matched row', async () => {
+  it('array operators referencing a column not on the table throw a clear error', async () => {
+    // `tags` doesn't exist on usersTable — the array-op compiler refuses
+    // it with the column name + table in the message (instead of a
+    // confusing Drizzle SQL error).
+    await expect(repo.findOneAndUpdate({ id: 'u1' }, { $push: { tags: 'x' } })).rejects.toThrow(
+      /\$push references unknown column 'tags'/,
+    );
+  });
+
+  it('updateMany accepts $set on every matched row', async () => {
     const res = await repo.updateMany({ role: 'reader' }, { $set: { active: false } });
     expect(res.matchedCount).toBe(2);
     expect(res.modifiedCount).toBe(2);

@@ -19,6 +19,7 @@ import {
   type ConformanceHarness,
   runStandardRepoConformance,
 } from '@classytic/repo-core/testing';
+import { SQLITEKIT_CAPABILITIES } from '../../src/capabilities.js';
 import { SqliteRepository } from '../../src/repository/index.js';
 import { conformanceTable } from '../fixtures/drizzle-schema.js';
 import { makeFixtureDb, type TestDb } from '../helpers/fixtures.js';
@@ -31,46 +32,12 @@ import { makeFixtureDb, type TestDb } from '../helpers/fixtures.js';
 const harness: ConformanceHarness<ConformanceDoc> = {
   name: 'sqlitekit (better-sqlite3)',
   idField: 'id',
-  features: {
-    transactions: true,
-    // better-sqlite3 uses a single connection; attempting to nest
-    // `withTransaction` triggers "cannot start a transaction within a
-    // transaction". The shared suite's nested-transaction scenarios are
-    // opt-in; leaving this false simply skips them.
-    nestedTransactions: false,
-    upsert: true,
-    duplicateKeyError: true,
-    distinct: true,
-    aggregate: true,
-    aggregateOps: {
-      // SQLite has no native `percentile_cont` / `percentile_disc`.
-      // Sqlitekit throws `'percentile' op is not supported on SQLite`
-      // — hosts that need percentile dashboards target mongokit (or
-      // future pgkit). Conformance scenario gates on this flag.
-      percentile: false,
-      // SQLite has no native STDDEV; computational formula is
-      // numerically unstable. Same asymmetric pattern as percentile.
-      stddev: false,
-      // SQLite ≥3.25 supports `RANK() OVER`; sqlitekit currently uses
-      // an in-memory post-processor at the JS level (see
-      // `actions/aggregate/topN.ts`). Result shape is identical to
-      // mongokit's window-function output.
-      topN: true,
-      // `unixepoch` floor-div arithmetic handles `{ every, unit }` bins.
-      customDateBuckets: true,
-      // SQLite's `strftime` supports `%H:%M` / `%H:00` natively.
-      dateBucketSubMinute: true,
-      // Per-request `cache?` slot routes through repo-core's unified
-      // `cachePlugin({ adapter })` when wired in the `plugins` array.
-      cache: true,
-    },
-    getOrCreate: true,
-    countAndExists: true,
-    // Compliance-grade tenant cleanup primitive. Sqlitekit chunks via
-    // raw Drizzle SELECT into deleteMany/updateMany so audit + cache
-    // plugins compose. See actions/purge.ts.
-    purgeByField: true,
-  },
+  // `ConformanceFeatures` is an alias of `RepoCapabilities` (repo-core
+  // 0.6.0) — the kit's runtime capability constant IS the feature
+  // declaration. Single source of truth: per-flag rationale lives in
+  // `src/capabilities.ts`. No overrides — the better-sqlite3 test
+  // environment matches the kit's declared capabilities exactly.
+  features: { ...SQLITEKIT_CAPABILITIES },
   async setup() {
     const db: TestDb = await makeFixtureDb();
     const repo = new SqliteRepository<ConformanceDoc>({

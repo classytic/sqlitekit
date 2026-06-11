@@ -27,12 +27,12 @@
  */
 
 import type { Filter } from '@classytic/repo-core/filter';
+import { recordToFilter } from '@classytic/repo-core/filter';
 import type { AggRequest } from '@classytic/repo-core/repository';
 import { nestDottedKeys } from '@classytic/repo-core/repository';
 import { type AnyColumn, asc, desc, getTableColumns, type SQL } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
 import { type ColumnResolver, compileFilterToDrizzle } from '../../filter/compile.js';
-import { recordToFilter } from '../../filter/from-record.js';
 import type { SqliteDb } from '../../repository/types.js';
 import { compileDateBucket } from './dateBucket.js';
 import { columnMissing } from './errors.js';
@@ -386,7 +386,7 @@ function resolveSchemaTable(
     if (fromDb) return fromDb;
     throw new Error(
       `sqlitekit/aggregate: lookup "from" table "${from}" not found in schema. ` +
-        `Pass schema via SqliteRepository constructor (\`new SqliteRepository({ schema })\`) ` +
+        `Pass the table registry via SqliteRepository constructor (\`new SqliteRepository({ tables })\`) ` +
         `or construct the db with \`drizzle(client, { schema })\` so the kit can resolve it.`,
     );
   };
