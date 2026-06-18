@@ -138,6 +138,21 @@ describe('buildCrudSchemasFromTable', () => {
       });
       expect(updateBody.properties).not.toHaveProperty('email');
     });
+
+    // Cross-kit invariant (mirrors mongokit's "PATCH safety" tests): the
+    // update body must carry NO `default` keyword. A host running Fastify/AJV
+    // with `useDefaults: true` (arc's createApp) would otherwise have the
+    // default INJECTED into a PATCH that omits the field, silently
+    // overwriting stored data. sqlitekit keeps SQL defaults in the DB and
+    // never emits them into body schemas — this guards that staying true.
+    it('emits no `default` keyword in any update-body property', () => {
+      // `users` has role.default('user') and active.default(true).
+      const { updateBody } = buildCrudSchemasFromTable(users);
+      const withDefault = Object.entries(updateBody.properties ?? {})
+        .filter(([, prop]) => 'default' in (prop as Record<string, unknown>))
+        .map(([key]) => key);
+      expect(withDefault).toEqual([]);
+    });
   });
 
   describe('params', () => {
