@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-08
+
+Standardization release — no API changes; peer-dependency floors and toolchain aligned with the current kit conventions (prismakit 0.2.0, mongokit 3.19).
+
+### Changed
+
+- **Peer floors raised**: `@classytic/repo-core >=0.7.0` (was `>=0.6.0`) and `drizzle-orm >=0.44.0` (was `>=0.30.0`). The drizzle floor now reflects the line CI actually proves (0.45.x); hosts on pre-0.44 drizzle should upgrade before taking this release. Hosts already on repo-core 0.7 / drizzle 0.44+ see zero behavior change — the full 620-test suite (including the cross-kit conformance run) passes unchanged.
+- **Toolchain**: tsdown `^0.22.3` (was `^0.21.8`); dev-tested against repo-core `^0.7.0`.
+
 ## [0.6.0] - 2026-06-11
 
 Adopts the `@classytic/repo-core` 0.6.0 contract. Clean break — no deprecation aliases, no dual paths.
