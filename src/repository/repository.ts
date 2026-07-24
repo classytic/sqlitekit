@@ -35,6 +35,9 @@ import type {
   AggPaginationRequest,
   AggRequest,
   AggResult,
+  ArchiveOptions,
+  ArchiveResult,
+  ArchiveSink,
   BulkWriteOperation,
   BulkWriteResult,
   DeleteOptions,
@@ -56,6 +59,7 @@ import type {
 import {
   RepositoryBase,
   type RepositoryBaseOptions,
+  runChunkedArchive,
   runChunkedPurge,
   throwIfAborted,
   withRetry,
@@ -83,6 +87,7 @@ import {
   executeAgg,
   isKeysetMode,
 } from '../actions/aggregate/index.js';
+import { createSqliteArchivePort } from '../actions/archive.js';
 import * as createActions from '../actions/create.js';
 import * as deleteActions from '../actions/delete.js';
 import { type ExplainRow, explain as explainAction } from '../actions/explain.js';
@@ -213,9 +218,11 @@ export interface SqliteQueryOptions extends QueryOptions {
  * **Cross-kit parallel.** mongokit's `aggregatePipeline(stages)` prepends a
  * `$match` for the host; SQL's typed query builders can't safely splice a
  * WHERE post-hoc, so sqlitekit hands the host the scope fragment and they
- * `and(scope, ...)` it into their `WHERE`. Future pgkit will use the
- * identical `SqlPipelineContext` shape — the only thing that changes per
- * kit is the `db` / `table` types (pg-flavored Drizzle).
+ * `and(scope, ...)` it into their `WHERE`. pgkit ships the identical shape
+ * (`PgPipelineContext` — pg-flavored `db`/`table`, scope compiled from the
+ * call-site `options.filters` since pgkit has no plugin layer), and
+ * prismakit's `PrismaPipelineContext` plays the same role with a Prisma
+ * `where` object (`scopeWhere`) instead of a SQL fragment.
  */
 export interface SqlPipelineContext {
   /**
@@ -1598,6 +1605,23 @@ export class SqliteRepository<
   ): Promise<TenantPurgeResult> {
     const port = createSqlitePurgePort(this, field, value);
     return runChunkedPurge(strategy, options, port);
+  }
+
+  /**
+   * Chunked cold-storage extraction — see `StandardRepo.archiveByFilter`
+   * for the cross-kit contract (write-before-delete, at-least-once,
+   * duplicate-tolerant sinks). Sqlitekit composes the kit-agnostic
+   * `runChunkedArchive` orchestrator with `createSqliteArchivePort`
+   * (raw PK-ordered SELECT reads + plugin-routed deleteMany removal).
+   * Implementation lives in [actions/archive.ts](../actions/archive.ts).
+   */
+  async archiveByFilter(
+    filter: Filter | Record<string, unknown>,
+    sink: ArchiveSink<TDoc>,
+    options: ArchiveOptions = {},
+  ): Promise<ArchiveResult> {
+    const port = createSqliteArchivePort<TDoc>(this, this.#asFilter(filter));
+    return runChunkedArchive(options, sink, port);
   }
 
   async upsert(data: Partial<TDoc>, options: WriteOptions = {}): Promise<TDoc> {

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — `DrizzleAdapter.matchesFilter` (in-process policy-filter enforcement)
+
+- **`DrizzleAdapter.matchesFilter`** now implements the `DataAdapter.matchesFilter` seam so hosts (arc's `AccessControl.validateItemAccess`, the realtime change feed) can validate an already-fetched row against arc's `_policyFilters` IN PROCESS, without a DB round-trip. **Impact for arc ≥2.22**: unblocks the realtime feed and in-process access validation for operator-shaped filters — a `requireGrant` list-resolution subscriber (`{ $or: [{ ownerId }, { id: { $in } }] }`) now streams correctly instead of hitting the fail-closed 501.
+- Delegates to repo-core's **canonical** `matchesRecordFilter` (repo-core ≥0.14.0) — the SINGLE shared matcher across every kit (no per-kit implementation, one contract, one Filter IR). It converts arc's Mongo-record filter to the portable Filter IR and evaluates via `matchFilter` — the SAME IR sqlitekit compiles to SQL via `compileFilterToDrizzle`, so in-memory and DB-level enforcement agree by construction.
+- Peer floor: `@classytic/repo-core >=0.14.0` (was `>=0.8.0` — closes the version skew; sqlitekit now aligns with mongokit + arc on one repo-core line). No new dependency.
+
+### Added — adapter `close()` stops kit-owned timers
+
+- `createDrizzleAdapter(...).close()` now releases the background timers the `ttlPlugin` / `vacuumPlugin` register on the repository (`repo.stopTtl()` / `repo.stopVacuum()`, when present) — a single uniform teardown call. Per the `DataAdapter.close` ownership rule it does **not** close the SQLite database; the host owns that.
+
+### Added — `archiveByFilter` (repo-core 0.8 data-lifecycle contract)
+
+- **`archiveByFilter(filter, sink, options)`** — chunked cold-storage extraction via repo-core's `runChunkedArchive` + `createSqliteArchivePort` (`actions/archive.ts`): PK-ordered raw SELECT reads (plugin-bypass — the caller's filter is authoritative), plugin-routed `deleteMany` removal (`bypassTenant`, `mode: 'hard'` — audit/cache fire), write-before-delete, at-least-once. Capability `archiveByFilter: true`. Accepts Filter IR or record filters.
+- Existing `cursor()` now satisfies the `StandardRepo.cursor` declaration added in repo-core 0.8; the new capability-gated conformance scenarios (archive + streaming) pass unchanged.
+- Peers: `@classytic/repo-core >=0.8.0`.
+
 ## [0.7.0] - 2026-07-08
 
 Standardization release — no API changes; peer-dependency floors and toolchain aligned with the current kit conventions (prismakit 0.2.0, mongokit 3.19).

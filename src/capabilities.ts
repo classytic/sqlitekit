@@ -49,6 +49,8 @@ export const SQLITEKIT_CAPABILITIES: RepoCapabilities = {
   countAndExists: true,
   /** `purgeByField(...)` — chunked compliance purge via `runChunkedPurge` + the sqlite purge port. */
   purgeByField: true,
+  /** `archiveByFilter(filter, sink)` — chunked cold-storage extraction (write-before-delete) via `runChunkedArchive` + the sqlite archive port. */
+  archiveByFilter: true,
   /**
    * Mongo array update operators (`$push` / `$pull` / `$addToSet` / `$pop` /
    * `$pullAll`) compiled to atomic `json_insert` / `json_each` SQL on JSON

@@ -23,6 +23,7 @@ import type {
   SchemaMetadata,
 } from '@classytic/repo-core/adapter';
 import { isRepository } from '@classytic/repo-core/adapter';
+import { matchesRecordFilter } from '@classytic/repo-core/filter';
 import type { SchemaBuilderOptions, SchemaGenerator } from '@classytic/repo-core/schema';
 import { mergeFieldRuleConstraints } from '@classytic/repo-core/schema';
 
@@ -203,6 +204,39 @@ export class DrizzleAdapter<TDoc = unknown> implements DataAdapter<TDoc> {
 
   async healthCheck(): Promise<boolean> {
     return typeof this.repository.getAll === 'function';
+  }
+
+  /**
+   * In-memory matcher for the `DataAdapter.matchesFilter` seam. Hosts
+   * (arc's `AccessControl.validateItemAccess`, the realtime change feed)
+   * validate an already-fetched row against arc's Mongo-shaped
+   * `_policyFilters` (`{ ownerId }`, `{ $or: [...] }`, `{ id: { $in } }`)
+   * WITHOUT a DB round-trip. Without this, arc falls back to its
+   * flat-equality helper and operator-shaped filters become unenforceable
+   * in-process (a `requireGrant` list-resolution subscriber → fail-closed
+   * 501 on realtime). Delegates to repo-core's canonical
+   * `matchesRecordFilter` (repo-core ≥0.14.0) — the SAME Filter IR
+   * sqlitekit compiles to SQL via `compileFilterToDrizzle`, so in-memory
+   * and DB enforcement agree by construction, and every kit shares one
+   * matcher. Arrow field: keeps its binding when passed by reference.
+   */
+  readonly matchesFilter = (item: unknown, filters: Record<string, unknown>): boolean =>
+    matchesRecordFilter(item, filters);
+
+  /**
+   * Release adapter-owned resources — the background timers the
+   * `ttlPlugin` / `vacuumPlugin` register on the repository
+   * (`repo.stopTtl()` / `repo.stopVacuum()`, present only when those
+   * plugins are wired). Idempotent and safe when neither is present.
+   *
+   * Per the `DataAdapter.close` ownership rule this does NOT close the
+   * SQLite database — the host opened it (`new Database(...)`) and closes
+   * it, since one connection is typically shared across resources.
+   */
+  async close(): Promise<void> {
+    const repo = this.repository as Partial<{ stopTtl: () => void; stopVacuum: () => void }>;
+    repo.stopTtl?.();
+    repo.stopVacuum?.();
   }
 }
 

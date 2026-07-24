@@ -166,8 +166,7 @@
     "release": "npm run push -- main && npm run release:tag && npm publish"
   },
   "peerDependencies": {
-    "@classytic/repo-core": ">=0.7.0",
-    "better-auth": ">=1.6.0",
+    "@classytic/repo-core": ">=0.14.0",
     "better-sqlite3": ">=12.0.0",
     "drizzle-orm": ">=0.44.0"
   },
@@ -183,16 +182,16 @@
     }
   },
   "devDependencies": {
-    "@better-auth/api-key": "^1.6.9",
+    "@better-auth/api-key": "^1.6.23",
     "@biomejs/biome": "^2.4.12",
     "@classytic/dev-tools": "^0.2.0",
-    "@classytic/repo-core": "^0.7.0",
+    "@classytic/repo-core": "^0.14.0",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.1.4",
     "ajv": "^8.18.0",
     "ajv-formats": "^3.0.1",
-    "better-auth": "^1.6.9",
+    "better-auth": "^1.6.23",
     "better-sqlite3": "^12.0.0",
     "drizzle-kit": "^0.31.10",
     "drizzle-orm": "^0.45.2",

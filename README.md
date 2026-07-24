@@ -1,5 +1,7 @@
 # @classytic/sqlitekit
 
+[![Sponsor](https://img.shields.io/github/sponsors/classytic?style=flat-square&label=Sponsor&logo=GitHub&color=EA4AAA)](https://github.com/sponsors/classytic)
+
 Drizzle-backed SQLite repository kit for Node, Expo / React Native, and edge runtimes (Cloudflare D1, libsql, bun:sqlite). One repository class — same code on every environment, only the driver line differs.
 
 Built on [`@classytic/repo-core`](https://www.npmjs.com/package/@classytic/repo-core), it implements the `StandardRepo<TDoc>` contract shared by [`@classytic/mongokit`](https://www.npmjs.com/package/@classytic/mongokit) and future kits (`pgkit`, `prismakit`) — controller code written against the contract runs unchanged on any kit.
