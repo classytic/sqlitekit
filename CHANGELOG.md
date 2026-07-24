@@ -7,6 +7,26 @@ adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — keyset progression in purge port (soft/anonymize termination)
+
+- The purge port's `soft` and `anonymize` kernels (subquery + fallback paths,
+  plus function-form) now select `id`-ascending behind an internal
+  `id > lastSeen` keyset cursor, satisfying repo-core 0.16.0's mandatory
+  `PurgePort` progression contract. Previously the bare `WHERE field = ?`
+  subquery re-selected the same first chunk forever once the match set
+  exceeded `batchSize` (soft-flagged / anonymized rows still match the
+  predicate); only `hard` self-advanced. The cursor advances after the chunk
+  write commits, so a retried chunk re-selects the same rows (at-least-once,
+  idempotent by outcome). `hard` keeps its cursor-free 1-round-trip subquery.
+- **Also fixed:** the function-form anonymize path used
+  `db.transaction(async cb)`, which the better-sqlite3 (sync) driver rejects
+  ("Transaction function cannot return a promise"). Replaced with driver-
+  portable manual `BEGIN`/`COMMIT`/`ROLLBACK` via `db.run` — works on both
+  sync (better-sqlite3) and async (libsql/D1) drivers.
+- Peer floor: `@classytic/repo-core >=0.16.0`.
+- New `tests/integration/purge-conformance.test.ts` runs the shared
+  `runPurgeConformance` suite (8 scenarios).
+
 ### Added — `DrizzleAdapter.matchesFilter` (in-process policy-filter enforcement)
 
 - **`DrizzleAdapter.matchesFilter`** now implements the `DataAdapter.matchesFilter` seam so hosts (arc's `AccessControl.validateItemAccess`, the realtime change feed) can validate an already-fetched row against arc's `_policyFilters` IN PROCESS, without a DB round-trip. **Impact for arc ≥2.22**: unblocks the realtime feed and in-process access validation for operator-shaped filters — a `requireGrant` list-resolution subscriber (`{ $or: [{ ownerId }, { id: { $in } }] }`) now streams correctly instead of hitting the fail-closed 501.

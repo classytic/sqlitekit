@@ -32,10 +32,20 @@
  * anonymize path uses raw Drizzle (per-row UPDATEs aren't a single op
  * the plugin layer expresses cleanly) — the host's audit plugin will
  * see N writes in that case.
+ *
+ * **Keyset progression (the PurgePort contract).** `soft` and
+ * `anonymize` writes mutate rows that STILL satisfy the bare
+ * `field = value` predicate, so re-running the same subquery would
+ * re-select the same first chunk forever. Those kernels therefore
+ * select `id`-ascending behind an internal `id > lastSeen` cursor that
+ * advances only after the chunk's write succeeds (retried chunks
+ * re-select the same rows — at-least-once, idempotent by outcome).
+ * `hard` needs no cursor: deleted rows leave the match set, so the bare
+ * subquery advances naturally and keeps its 1-round-trip optimum.
  */
 
 import type { Filter } from '@classytic/repo-core/filter';
-import { and as fAnd, eq as fEq, in_ as fIn } from '@classytic/repo-core/filter';
+import { and as fAnd, eq as fEq, gt as fGt, in_ as fIn } from '@classytic/repo-core/filter';
 import type { PurgePort, WritingPurgeStrategy } from '@classytic/repo-core/repository';
 import { getTableName, sql } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
@@ -63,8 +73,28 @@ interface PurgeableRepo {
 }
 
 /**
+ * Mutable single-run keyset shared between the port and its mutating
+ * kernels (soft / anonymize). `cursor` holds the highest row id whose
+ * chunk COMMITTED; selection is `id`-ascending behind `id > cursor`.
+ */
+interface Keyset {
+  cursor: unknown;
+}
+
+/** Highest id in a returned chunk (rows may come back unordered). */
+function maxId(rows: Array<Record<string, unknown>>, idColName: string): unknown {
+  let max: unknown = null;
+  for (const r of rows) {
+    const v = r[idColName] ?? Object.values(r)[0];
+    if (max === null || (v as never) > (max as never)) max = v;
+  }
+  return max;
+}
+
+/**
  * Build a `PurgePort` bound to a repository + the `field = value`
- * predicate the purge targets.
+ * predicate the purge targets. A port instance is single-run state
+ * (it carries the keyset cursor) — build a fresh one per purge run.
  */
 export function createSqlitePurgePort(
   repo: PurgeableRepo,
@@ -78,6 +108,8 @@ export function createSqlitePurgePort(
     );
   }
 
+  const keyset: Keyset = { cursor: null };
+
   return {
     async purgeChunk(strategy: WritingPurgeStrategy, limit: number): Promise<number> {
       // Anonymize with function-form replacers — fetch docs, per-row
@@ -85,7 +117,7 @@ export function createSqlitePurgePort(
       if (strategy.type === 'anonymize') {
         const hasFn = Object.values(strategy.fields).some((v) => typeof v === 'function');
         if (hasFn) {
-          return purgeAnonymizeFunctional(repo, field, value, strategy.fields, limit);
+          return purgeAnonymizeFunctional(repo, field, value, strategy.fields, limit, keyset);
         }
         // Static fields fall through to the id-IN-subquery shape.
       }
@@ -93,10 +125,12 @@ export function createSqlitePurgePort(
       // Per-strategy kernels build their own `id IN (subquery)` shape.
       switch (strategy.type) {
         case 'hard': {
+          // No cursor: hard-deleted rows leave the match set, so the bare
+          // subquery advances naturally and keeps the 1-RT optimum.
           return purgeHardWithSubquery(repo, field, value, limit);
         }
         case 'soft': {
-          return purgeSoftWithSubquery(repo, field, value, strategy, limit);
+          return purgeSoftWithSubquery(repo, field, value, strategy, limit, keyset);
         }
         case 'anonymize': {
           return purgeAnonymizeStaticWithSubquery(
@@ -105,6 +139,7 @@ export function createSqlitePurgePort(
             value,
             strategy.fields as Record<string, unknown>,
             limit,
+            keyset,
           );
         }
       }
@@ -187,6 +222,10 @@ async function purgeHardFallback(
  * Soft delete — UPDATE with id-IN-subquery + RETURNING for the count.
  * One statement, one round-trip on supporting drivers; falls back to
  * SELECT + updateMany on drivers without UPDATE RETURNING.
+ *
+ * Keyset-progressed: soft-flagged rows still match `field = value`, so
+ * the subquery selects `id`-ascending past `keyset.cursor` and the
+ * cursor advances only after the write commits.
  */
 async function purgeSoftWithSubquery(
   repo: PurgeableRepo,
@@ -194,6 +233,7 @@ async function purgeSoftWithSubquery(
   value: unknown,
   strategy: Extract<WritingPurgeStrategy, { type: 'soft' }>,
   limit: number,
+  keyset: Keyset,
 ): Promise<number> {
   const fieldCol = repo.columns[field];
   const idCol = repo.idColumn;
@@ -206,17 +246,19 @@ async function purgeSoftWithSubquery(
   // plugin-routed updateMany path in that case (matches the contract:
   // host pre-declares the column shape OR the kit warns at boot).
   if (!deletedCol || !deletedAtCol) {
-    return purgeSoftFallback(repo, field, value, strategy, limit);
+    return purgeSoftFallback(repo, field, value, strategy, limit, keyset);
   }
 
   const nowIso = new Date().toISOString();
+  const cursorFrag = keyset.cursor == null ? sql`` : sql` AND ${idCol} > ${keyset.cursor}`;
   try {
     const rows = (await repo.db.all(
-      sql`UPDATE ${repo.table} SET ${deletedCol} = 1, ${deletedAtCol} = ${nowIso} WHERE ${idCol} IN (SELECT ${idCol} FROM ${repo.table} WHERE ${fieldCol} = ${value} LIMIT ${sql.raw(String(limit))}) RETURNING ${idCol}`,
+      sql`UPDATE ${repo.table} SET ${deletedCol} = 1, ${deletedAtCol} = ${nowIso} WHERE ${idCol} IN (SELECT ${idCol} FROM ${repo.table} WHERE ${fieldCol} = ${value}${cursorFrag} ORDER BY ${idCol} LIMIT ${sql.raw(String(limit))}) RETURNING ${idCol}`,
     )) as Array<Record<string, unknown>>;
+    if (rows.length > 0) keyset.cursor = maxId(rows, idCol.name);
     return rows.length;
   } catch {
-    return purgeSoftFallback(repo, field, value, strategy, limit);
+    return purgeSoftFallback(repo, field, value, strategy, limit, keyset);
   }
 }
 
@@ -226,13 +268,19 @@ async function purgeSoftFallback(
   value: unknown,
   strategy: Extract<WritingPurgeStrategy, { type: 'soft' }>,
   limit: number,
+  keyset: Keyset,
 ): Promise<number> {
   const idCol = repo.idColumn;
   const idColName = idCol.name;
+  const selectFilter: Filter =
+    keyset.cursor == null
+      ? fEq(field, value)
+      : fAnd(fEq(field, value), fGt(idColName, keyset.cursor));
   const ids = (await repo.db
     .select({ [idColName]: idCol })
     .from(repo.table)
-    .where(compileFilterToDrizzle(fEq(field, value), repo.table)!)
+    .where(compileFilterToDrizzle(selectFilter, repo.table)!)
+    .orderBy(idCol)
     .limit(limit)
     .all()) as Array<Record<string, unknown>>;
 
@@ -255,6 +303,8 @@ async function purgeSoftFallback(
     },
     { bypassTenant: true },
   );
+  // ids are ordered ascending — the last one is the chunk's high-water mark.
+  keyset.cursor = ids[ids.length - 1]?.[idColName] ?? keyset.cursor;
   return ids.length;
 }
 
@@ -269,6 +319,7 @@ async function purgeAnonymizeStaticWithSubquery(
   value: unknown,
   fields: Record<string, unknown>,
   limit: number,
+  keyset: Keyset,
 ): Promise<number> {
   // SELECT ids first to bound the updateMany filter — keeps the audit
   // plugin's "rows touched" count accurate, which is more important than
@@ -276,10 +327,15 @@ async function purgeAnonymizeStaticWithSubquery(
   // than hard / soft, and the audit trail value is high).
   const idCol = repo.idColumn;
   const idColName = idCol.name;
+  const selectFilter: Filter =
+    keyset.cursor == null
+      ? fEq(field, value)
+      : fAnd(fEq(field, value), fGt(idColName, keyset.cursor));
   const ids = (await repo.db
     .select({ [idColName]: idCol })
     .from(repo.table)
-    .where(compileFilterToDrizzle(fEq(field, value), repo.table)!)
+    .where(compileFilterToDrizzle(selectFilter, repo.table)!)
+    .orderBy(idCol)
     .limit(limit)
     .all()) as Array<Record<string, unknown>>;
 
@@ -293,6 +349,7 @@ async function purgeAnonymizeStaticWithSubquery(
     ),
   );
   await repo.updateMany(chunkFilter, { $set: fields }, { bypassTenant: true });
+  keyset.cursor = ids[ids.length - 1]?.[idColName] ?? keyset.cursor;
   return ids.length;
 }
 
@@ -309,35 +366,48 @@ async function purgeAnonymizeFunctional(
   value: unknown,
   fields: Record<string, unknown | ((doc: Record<string, unknown>) => unknown)>,
   limit: number,
+  keyset: Keyset,
 ): Promise<number> {
   const fieldCol = repo.columns[field];
   const idCol = repo.idColumn;
   const idColName = idCol.name;
 
+  const where =
+    keyset.cursor == null
+      ? sql`${fieldCol} = ${value}`
+      : sql`${fieldCol} = ${value} AND ${idCol} > ${keyset.cursor}`;
   const docs = (await repo.db
     .select()
     .from(repo.table)
-    .where(sql`${fieldCol} = ${value}`)
+    .where(where)
+    .orderBy(idCol)
     .limit(limit)
     .all()) as Array<Record<string, unknown>>;
 
   if (docs.length === 0) return 0;
 
-  // Per-row UPDATE bundled in a single transaction. Cast to any because
-  // Drizzle's transaction overloads differ across sync/async drivers
-  // and the BaseSQLiteDatabase union type doesn't expose a unified shape.
-  // The actual call is identical for both — `tx.update(table).set(...).where(...)`.
-  await (
-    repo.db as unknown as { transaction: (cb: (tx: SqliteDb) => unknown) => Promise<unknown> }
-  ).transaction(async (tx) => {
+  // Per-row UPDATE bundled in a single transaction via manual
+  // BEGIN/COMMIT. We can't use Drizzle's `db.transaction(cb)` here: the
+  // better-sqlite3 (sync) driver REJECTS an async callback ("Transaction
+  // function cannot return a promise"), while libsql/D1 require one — no
+  // single callback shape satisfies both. Manual statements via `db.run`
+  // work identically on every driver (sync executes inline; async awaits).
+  await repo.db.run(sql`BEGIN`);
+  try {
     for (const doc of docs) {
       const set: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(fields)) {
         set[k] = typeof v === 'function' ? (v as (d: Record<string, unknown>) => unknown)(doc) : v;
       }
-      await tx.update(repo.table).set(set).where(sql`${idCol} = ${doc[idColName]}`);
+      await repo.db.update(repo.table).set(set).where(sql`${idCol} = ${doc[idColName]}`);
     }
-  });
+    await repo.db.run(sql`COMMIT`);
+  } catch (err) {
+    await repo.db.run(sql`ROLLBACK`);
+    throw err;
+  }
 
+  // docs are ordered ascending — advance the keyset past this chunk.
+  keyset.cursor = docs[docs.length - 1]?.[idColName] ?? keyset.cursor;
   return docs.length;
 }
