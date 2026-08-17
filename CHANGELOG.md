@@ -7,6 +7,61 @@ adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — optimistic concurrency (`ifVersion` CAS)
+
+- **`new SqliteRepository({ versionField })`** enables repo-core's
+  `WriteOptions.ifVersion` contract: `update(id, patch, { ifVersion: n })`
+  applies only at version `n` and bumps it in the SAME statement, so there is
+  no read-then-write window. Opt-in with no default column name — mongoose
+  ships `__v` on every document, SQL does not, and guessing `'version'` would
+  bind the guard to whatever a table happened to call that column.
+- **The miss is disambiguated, which is the whole point of the contract.** A
+  CAS that matches nothing is two different facts: the row is gone (returns
+  `null`, the ordinary miss) or the row moved past the expected version
+  (throws `VersionConflictError` with `actualVersion`). Collapsing them into
+  `null` would read as not-found to every caller and invite the blind retry
+  that overwrites the concurrent write.
+- **A `versionField` naming a column that isn't on the table is BOOT-fatal**,
+  and an `ifVersion` passed to a repository without one **throws**. A silently
+  dropped guard is not a degraded mode — the write succeeds, returns a
+  plausible document, and the caller has no way to notice.
+- `capabilities.optimisticConcurrency` is derived per instance (`true` once a
+  version column is named, `false` on the module constant), and the version
+  travels through `bindToTx`, so a CAS that is correct outside a transaction
+  stays correct inside one.
+- **`replace()` advances the version rather than NULL-filling it.** The stamp
+  is repository metadata, not document content; on a `notNull` column the fill
+  raised a constraint error for the wrong reason, and on a nullable one it
+  erased the version so every later CAS compared against NULL and reported a
+  permanent conflict on an uncontended row. `replace()` **refuses**
+  `ifVersion` (rather than ignoring it) — the CAS is defined for `update`.
+
+### Added — declared transaction-retry ownership + `TransactionHandle`
+
+- **`capabilities.transactionRetry: 'caller'`.** `withManualTransaction`
+  issues one `BEGIN … COMMIT` and re-throws; it never re-runs the callback, so
+  an outer `retryingTransaction` owns the loop. repo-core reads ABSENT as
+  `'managed'`, under which the envelope adds no retry at all — a
+  `SQLITE_BUSY` abort would have surfaced as a hard failure on a kit that is
+  perfectly safe to re-run.
+- **`withTransaction(fn)` now passes the repo-core `TransactionHandle`** as
+  the callback's second argument. SQLite's transaction is bound to the
+  CONNECTION, so `session` stays absent and the tx-bound `txRepo` remains the
+  only join point — but the ARGUMENT is the contract: an outbox writer asking
+  for `uow.session` must get a defined answer instead of crashing on a missing
+  parameter.
+
+### Fixed — `pages: 0` for an empty offset envelope
+
+- `aggregatePaginate` and `lookupPopulate` floored an empty result at
+  `Math.max(1, …)`, reporting one page for zero rows: a pager renders `1 / 1`
+  for nothing and a fetch-every-page loop issues a request for a page that
+  cannot exist. Both now agree with `PaginationEngine` (and mongokit), which
+  already returned `0`. Pinned by repo-core 0.22.0's conformance assertion
+  plus a kit-local lookup case.
+- Peer floor: `@classytic/repo-core >=0.23.0` — `src/` now imports
+  `TransactionHandle` (first exported there) and `VersionConflictError`.
+
 ### Fixed — keyset progression in purge port (soft/anonymize termination)
 
 - The purge port's `soft` and `anonymize` kernels (subquery + fallback paths,

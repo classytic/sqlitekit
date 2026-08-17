@@ -35,7 +35,8 @@ CREATE TABLE `conformance` (
 	`count` integer DEFAULT 0 NOT NULL,
 	`active` integer DEFAULT true NOT NULL,
 	`notes` text,
-	`createdAt` text NOT NULL
+	`createdAt` text NOT NULL,
+	`version` integer DEFAULT 0 NOT NULL
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `conformance_email_unique` ON `conformance` (`email`);

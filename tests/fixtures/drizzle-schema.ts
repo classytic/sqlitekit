@@ -74,6 +74,12 @@ export const conformanceTable = sqliteTable('conformance', {
   active: integer('active', { mode: 'boolean' }).notNull().default(true),
   notes: text('notes'),
   createdAt: text('createdAt').notNull(),
+  // Optimistic-concurrency stamp for the shared suite's `ifVersion CAS`
+  // scenarios. `notNull().default(0)` so `create()` returns a version the
+  // conformance harness can read straight off the created row — the suite
+  // asserts `version(updated) === version(created) + 1`, which needs a
+  // defined starting value, not NULL.
+  version: integer('version').notNull().default(0),
 });
 
 export type UserRow = typeof usersTable.$inferSelect;

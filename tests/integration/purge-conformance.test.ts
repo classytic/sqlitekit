@@ -8,13 +8,13 @@
  * caller hand-adding exclusion predicates.
  */
 
+import type { TenantPurgeOptions, TenantPurgeStrategy } from '@classytic/repo-core/repository';
+import type { PurgeConformanceContext } from '@classytic/repo-core/testing';
+import { runPurgeConformance } from '@classytic/repo-core/testing';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { integer, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 import { describe } from 'vitest';
-import type { TenantPurgeOptions, TenantPurgeStrategy } from '@classytic/repo-core/repository';
-import type { PurgeConformanceContext } from '@classytic/repo-core/testing';
-import { runPurgeConformance } from '@classytic/repo-core/testing';
 import { SqliteRepository } from '../../src/repository/index.js';
 
 const purgeRows = sqliteTable('purge_rows', {
@@ -66,10 +66,20 @@ async function makeContext(): Promise<PurgeConformanceContext> {
       const tx = raw.transaction(() => {
         for (let i = 0; i < inScope; i++) {
           // Zero-padded ids keep TEXT keyset ordering aligned with seed order.
-          insert.run(`in-${String(i).padStart(4, '0')}`, SCOPE, `user-${i}@test.local`, AMOUNT_EACH);
+          insert.run(
+            `in-${String(i).padStart(4, '0')}`,
+            SCOPE,
+            `user-${i}@test.local`,
+            AMOUNT_EACH,
+          );
         }
         for (let i = 0; i < outOfScope; i++) {
-          insert.run(`out-${String(i).padStart(4, '0')}`, OTHER, `other-${i}@test.local`, AMOUNT_EACH);
+          insert.run(
+            `out-${String(i).padStart(4, '0')}`,
+            OTHER,
+            `other-${i}@test.local`,
+            AMOUNT_EACH,
+          );
         }
       });
       tx();
@@ -87,9 +97,11 @@ async function makeContext(): Promise<PurgeConformanceContext> {
         value,
       ),
     sumAmount: async () =>
-      (raw
-        .prepare('SELECT COALESCE(SUM(amount), 0) AS n FROM purge_rows WHERE organizationId = ?')
-        .get(SCOPE) as { n: number }).n,
+      (
+        raw
+          .prepare('SELECT COALESCE(SUM(amount), 0) AS n FROM purge_rows WHERE organizationId = ?')
+          .get(SCOPE) as { n: number }
+      ).n,
     countOutOfScope: async () =>
       count('SELECT COUNT(*) AS n FROM purge_rows WHERE organizationId = ?', OTHER),
   };

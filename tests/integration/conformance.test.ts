@@ -35,20 +35,45 @@ const harness: ConformanceHarness<ConformanceDoc> = {
   // `ConformanceFeatures` is an alias of `RepoCapabilities` (repo-core
   // 0.6.0) — the kit's runtime capability constant IS the feature
   // declaration. Single source of truth: per-flag rationale lives in
-  // `src/capabilities.ts`. No overrides — the better-sqlite3 test
-  // environment matches the kit's declared capabilities exactly.
-  features: { ...SQLITEKIT_CAPABILITIES },
+  // `src/capabilities.ts`.
+  //
+  // ONE deliberate override, and it is not a fudge: `optimisticConcurrency`
+  // is a PER-INSTANCE capability in sqlitekit (SQLite has no implicit
+  // version column, so the guard exists only once a host names one), and
+  // `setup()` below constructs the repo WITH `versionField: 'version'`.
+  // The module constant describes the unconfigured default; this harness
+  // describes the repo it actually builds. `setup()` asserts the two agree
+  // for this instance, so the override cannot quietly become a lie.
+  features: { ...SQLITEKIT_CAPABILITIES, optimisticConcurrency: true },
+  versionField: 'version',
+  // The suite's default is a Mongo-shaped all-zero ObjectId; SQLite ids are
+  // plain TEXT, so supply one that is merely absent rather than malformed —
+  // the scenario is "not-found stays null", not "invalid id".
+  missingId: 'doc_definitely_missing',
   async setup() {
     const db: TestDb = await makeFixtureDb();
     const repo = new SqliteRepository<ConformanceDoc>({
       db: db.db,
       table: conformanceTable,
+      versionField: 'version',
     });
+    // Guard the one `features` override above: if `versionField` ever stops
+    // flipping the capability, the suite would keep RUNNING the ifVersion
+    // scenarios against a repo that silently dropped the guard — and they
+    // would fail for a confusing reason. Fail here, on the declaration.
+    if (repo.capabilities.optimisticConcurrency !== true) {
+      throw new Error(
+        'conformance harness declares optimisticConcurrency: true but the constructed ' +
+          'repository reports ' +
+          String(repo.capabilities.optimisticConcurrency),
+      );
+    }
     // Cache scenarios use a separate repo instance with the unified
     // `cachePlugin({ adapter })` wired — hermetic per setup().
     const cachedRepo = new SqliteRepository<ConformanceDoc>({
       db: db.db,
       table: conformanceTable,
+      versionField: 'version',
       plugins: [cachePlugin({ adapter: createMemoryCacheAdapter() })],
     });
     return {

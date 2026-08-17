@@ -54,6 +54,7 @@ import type {
   TenantPurgeOptions,
   TenantPurgeResult,
   TenantPurgeStrategy,
+  TransactionHandle,
   WriteOptions,
 } from '@classytic/repo-core/repository';
 import {
@@ -200,6 +201,26 @@ export interface SqliteRepositoryOptions<TTable extends SQLiteTable = SQLiteTabl
    * Default: `'better-sqlite3'`-class behavior (transactions on).
    */
   driver?: 'better-sqlite3' | 'libsql' | 'expo' | 'bun' | 'd1';
+  /**
+   * Column carrying the optimistic-concurrency version for
+   * `update(id, data, { ifVersion })` CAS writes.
+   *
+   * Unset by default and there is deliberately no fallback name: mongoose
+   * ships `__v` on every document, SQL does not, so guessing `'version'`
+   * would silently bind the guard to whatever a table happened to call that
+   * column — or leave `capabilities.optimisticConcurrency` claiming a guard
+   * that no column backs. Naming it is the opt-in.
+   *
+   * Boot-fatal when the named column isn't on the table: a CAS predicate
+   * against a non-existent column is a wiring bug, and discovering it on the
+   * first concurrent write is discovering it in production.
+   *
+   * Distinct from `claimVersion({ field })`, which takes its version column
+   * per call and returns `null` on a miss. `ifVersion` is the repo-core
+   * contract: it THROWS `VersionConflictError` on a stale version and stays
+   * `null` only for a genuinely absent row.
+   */
+  versionField?: string;
 }
 
 /** Read-operation extensions on top of repo-core's `QueryOptions`. */
@@ -327,10 +348,18 @@ export class SqliteRepository<
    */
   readonly tables: Record<string, SQLiteTable> | undefined;
   /**
+   * Optimistic-concurrency version column, or `undefined` when the host
+   * didn't name one. Resolved (and validated against the table) at
+   * construction so `update({ ifVersion })` never has to re-derive it.
+   */
+  readonly versionField: string | undefined;
+  readonly versionColumn: SQLiteColumn | undefined;
+  /**
    * Runtime capability flags — the `StandardRepo` feature-detection
    * contract (repo-core ≥ 0.6.0). Derived from `SQLITEKIT_CAPABILITIES`
    * with per-instance adjustments: a `driver: 'd1'` hint flips
-   * `transactions` off (D1 has no cross-statement transactions).
+   * `transactions` off (D1 has no cross-statement transactions), and a
+   * configured `versionField` flips `optimisticConcurrency` on.
    */
   readonly capabilities: RepoCapabilities;
 
@@ -354,6 +383,7 @@ export class SqliteRepository<
       idField,
       tables,
       driver,
+      versionField,
       schema,
       updateSchema,
       events,
@@ -386,13 +416,36 @@ export class SqliteRepository<
     this.db = db;
     this.table = table;
     this.tables = tables;
-    // Per-instance capability derivation — D1 can't run withTransaction
-    // (no cross-statement transactions; BEGIN fails at the driver).
-    this.capabilities =
-      driver === 'd1' ? { ...SQLITEKIT_CAPABILITIES, transactions: false } : SQLITEKIT_CAPABILITIES;
 
     const columns = getTableColumns(table) as Record<string, SQLiteColumn>;
     this.columns = columns;
+
+    // Optimistic concurrency is opt-in per instance. Validate the column
+    // HERE, at construction: a `versionField` naming a column that doesn't
+    // exist would compile to a CAS predicate on a phantom column, and the
+    // only symptom would be a write that never matches — indistinguishable
+    // from a permanent version conflict.
+    if (versionField !== undefined && !columns[versionField]) {
+      throw new Error(
+        `sqlitekit: versionField "${versionField}" is not a column on table "${tableName}". ` +
+          `Add the column (integer, defaulting to 0) or drop the option — a CAS guard on a ` +
+          `column that doesn't exist would never match any row.`,
+      );
+    }
+    this.versionField = versionField;
+    this.versionColumn = versionField !== undefined ? columns[versionField] : undefined;
+
+    // Per-instance capability derivation — D1 can't run withTransaction
+    // (no cross-statement transactions; BEGIN fails at the driver), and
+    // `optimisticConcurrency` is true only once a version column is named.
+    this.capabilities =
+      driver === 'd1' || versionField !== undefined
+        ? {
+            ...SQLITEKIT_CAPABILITIES,
+            ...(driver === 'd1' ? { transactions: false } : {}),
+            ...(versionField !== undefined ? { optimisticConcurrency: true } : {}),
+          }
+        : SQLITEKIT_CAPABILITIES;
 
     // Resolve PK: explicit `idField` > Drizzle column marked `.primaryKey()` > error.
     const pk = idField
@@ -612,11 +665,40 @@ export class SqliteRepository<
 
   async update(id: string, data: Partial<TDoc>, options: WriteOptions = {}): Promise<TDoc | null> {
     throwIfAborted(options.signal);
+    /**
+     * `ifVersion` on a repository with no version column is a WIRING bug, and
+     * repo-core's contract is explicit that it must throw rather than degrade:
+     * a silently dropped guard is not a weaker guard, it is no guard at all,
+     * and the caller has no way to notice — the write succeeds and returns a
+     * perfectly plausible document. Thrown before `_buildContext` so it can't
+     * be mistaken for a data-level failure by an `error:update` subscriber.
+     */
+    if (options.ifVersion !== undefined && this.versionColumn === undefined) {
+      throw new Error(
+        `sqlitekit: update({ ifVersion }) requires a versionField, but repository ` +
+          `"${this.modelName}" was constructed without one. Pass ` +
+          `\`new SqliteRepository({ ..., versionField: '<column>' })\` — SQLite has no implicit ` +
+          `version column, so the guard cannot be inferred, and dropping it silently would ` +
+          `let a concurrent write clobber this one.`,
+      );
+    }
     const context = await this._buildContext('update', { id, data, ...options });
     return this._runOp('update', context, () => {
       const payload = (context.data ?? data) as Partial<TDoc>;
       const scope = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
       const scopeWhere = compileFilterToDrizzle(scope, this.table);
+      if (options.ifVersion !== undefined && this.versionColumn !== undefined) {
+        return updateActions.updateByIdCas<TDoc>(
+          this.db,
+          this.table,
+          this.idColumn,
+          id,
+          payload,
+          this.versionColumn,
+          options.ifVersion,
+          scopeWhere,
+        );
+      }
       return updateActions.updateById<TDoc>(
         this.db,
         this.table,
@@ -654,6 +736,18 @@ export class SqliteRepository<
     replacement: Partial<TDoc>,
     options: WriteOptions = {},
   ): Promise<TDoc | null> {
+    // `ifVersion` is an `update` verb. Refused rather than ignored here: the
+    // two have different write semantics (partial overwrite vs NULL-fill), so
+    // honouring the option would mean inventing a CAS contract for replace
+    // that repo-core doesn't define — but dropping it silently would leave a
+    // caller believing a guard ran. Say so instead.
+    if (options.ifVersion !== undefined) {
+      throw new Error(
+        `sqlitekit: replace() does not support \`ifVersion\` — the optimistic-concurrency CAS ` +
+          `is defined for update(). Use \`update(id, patch, { ifVersion })\`, or read-then-` +
+          `replace inside \`withTransaction\`.`,
+      );
+    }
     const context = await this._buildContext('replace', { id, data: replacement, ...options });
     return this._runOp('replace', context, () => {
       const payload = (context.data ?? replacement) as Partial<TDoc>;
@@ -666,6 +760,7 @@ export class SqliteRepository<
         id,
         payload,
         scopeWhere,
+        this.versionColumn,
       );
     });
   }
@@ -1957,7 +2052,13 @@ export class SqliteRepository<
       executeAgg<TRow>(this.db, this.table, { ...normalized, limit, offset }, aggOpts),
       countAggGroups(this.db, this.table, normalized, aggOpts),
     ]);
-    const pages = Math.max(1, Math.ceil(total / limit));
+    // `Math.max(1, …)` here used to floor an empty result at one page, which
+    // reads as "there is a page, it just happens to be blank" — a pager UI
+    // renders `1 / 1` and a "fetch every page" loop makes a guaranteed-empty
+    // request. Zero rows is zero pages, which is what `PaginationEngine` (and
+    // mongokit) already report; the floor was this envelope disagreeing with
+    // the kit's own.
+    const pages = total === 0 ? 0 : Math.ceil(total / limit);
     return {
       method: 'offset',
       data: pageData,
@@ -2140,6 +2241,12 @@ export class SqliteRepository<
       name: this.modelName,
       pluginOrderChecks: 'off',
       ...(this.tables ? { tables: this.tables } : {}),
+      // The version column travels with the binding. Dropping it would make
+      // the SAME repository lose `optimisticConcurrency` the moment a caller
+      // stepped inside `withTransaction` — and an `ifVersion` write that is
+      // correct outside a transaction would start throwing "requires a
+      // versionField" inside one.
+      ...(this.versionField !== undefined ? { versionField: this.versionField } : {}),
     });
   }
 
@@ -2147,9 +2254,19 @@ export class SqliteRepository<
    * Run `fn` inside a Drizzle transaction. Callback receives a
    * tx-scoped repository — invoke methods on it, not on the outer
    * repo, so the BEGIN/COMMIT actually wraps your ops.
+   *
+   * The second argument is the repo-core `TransactionHandle`. SQLite's
+   * transaction is bound to the CONNECTION, not to a session object, so
+   * there is nothing to hand out and `session` stays absent — the tx-bound
+   * `txRepo` is the only join point. The argument is still passed, because
+   * the contract is the ARGUMENT: an outbox writer enlisting via
+   * `uow.session` must be able to ask and get a defined answer (`undefined`
+   * session, present handle) rather than crash on a missing parameter.
    */
-  async withTransaction<T>(fn: (txRepo: SqliteRepository<TDoc>) => Promise<T>): Promise<T> {
-    return withManualTransaction(this.db, async (tx) => fn(this.bindToTx(tx)));
+  async withTransaction<T>(
+    fn: (txRepo: SqliteRepository<TDoc>, uow: TransactionHandle) => Promise<T>,
+  ): Promise<T> {
+    return withManualTransaction(this.db, async (tx) => fn(this.bindToTx(tx), {}));
   }
 
   /**

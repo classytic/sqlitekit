@@ -21,6 +21,26 @@ export const SQLITEKIT_CAPABILITIES: RepoCapabilities = {
   transactions: true,
   /** Single connection, no SAVEPOINT wrapping — nested `withTransaction` raises "cannot start a transaction within a transaction". */
   nestedTransactions: false,
+  /**
+   * `'caller'` — `withManualTransaction` issues ONE `BEGIN … COMMIT` and
+   * re-throws; it never re-runs the callback. An outer `retryingTransaction`
+   * envelope therefore owns the loop, which is the whole reason this flag
+   * must be DECLARED: absent means `'managed'`, and under that reading the
+   * envelope adds no retry at all, so a `SQLITE_BUSY` abort would surface as
+   * a hard failure on a kit that is perfectly safe to re-run. The mirror-image
+   * mistake (declaring `'managed'` here) would stack a second policy on a
+   * self-retrying driver — see mongokit, which genuinely is `'managed'`.
+   */
+  transactionRetry: 'caller',
+  /**
+   * `WriteOptions.ifVersion` CAS. **Per-instance**: SQLite has no implicit
+   * version column the way mongoose has `__v`, so the guard exists only once
+   * a host names the column via `new SqliteRepository({ versionField })`.
+   * The constant declares the UNCONFIGURED default; the constructor flips it
+   * to `true` for instances that carry one, and an `ifVersion` passed to an
+   * instance without one THROWS rather than dropping the guard.
+   */
+  optimisticConcurrency: false,
   /** `findOneAndUpdate(filter, update, { upsert: true })` — SELECT-then-INSERT inside a transaction. */
   upsert: true,
   /** `isDuplicateKeyError` classifies `SQLITE_CONSTRAINT_UNIQUE` / `SQLITE_CONSTRAINT_PRIMARYKEY`. */

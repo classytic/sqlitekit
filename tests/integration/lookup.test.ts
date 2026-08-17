@@ -541,6 +541,32 @@ describe('lookupPopulate â€” pagination', () => {
     expect(result.hasNext).toBe(true);
     expect(result.data).toHaveLength(2);
   });
+
+  it('an empty match reports pages: 0, not a phantom page 1', async () => {
+    // `Math.max(1, ceil(0/limit))` used to floor this at 1 — a pager renders
+    // "1 / 1" for nothing, and a fetch-every-page loop issues a request for a
+    // page that cannot exist. Same rule the offset PaginationEngine and
+    // aggregatePaginate follow.
+    const result = await employees.lookupPopulate({
+      filters: { id: '__no_such_employee__' },
+      lookups: [
+        {
+          from: 'departments',
+          localField: 'departmentId',
+          foreignField: 'id',
+          as: 'department',
+          single: true,
+        },
+      ],
+      sort: { id: 1 },
+      page: 1,
+      limit: 2,
+    });
+    expect(result.data).toHaveLength(0);
+    expect(result.total).toBe(0);
+    expect(result.pages).toBe(0);
+    expect(result.hasNext).toBe(false);
+  });
 });
 
 describe('lookupPopulate â€” validation errors', () => {

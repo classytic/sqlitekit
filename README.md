@@ -252,7 +252,7 @@ Two choices, picked by your environment + use case:
 
 | API | When to use |
 |---|---|
-| `repo.withTransaction(fn)` | Multi-statement business logic with **plugin hooks active** (multi-tenant scope, audit, soft-delete). Callback receives a tx-bound repo. **Throws on D1.** |
+| `repo.withTransaction(fn)` | Multi-statement business logic with **plugin hooks active** (multi-tenant scope, audit, soft-delete). Callback receives `(txRepo, uow)`. **Throws on D1.** |
 | `repo.batch(b => [...])` | Pre-built statement list, **no hooks**, fast atomic write. Native D1 batch (one HTTP call) where available, transaction-wrapped sequential awaits everywhere else. |
 | `withBatch(db, b => [...])` | Cross-repo version of `repo.batch` — bind multiple repos in one atomic unit. |
 
@@ -269,6 +269,51 @@ await withBatch(db, (b) => [
   b(inventoryRepo).update('sku-123', { qty: stock - 1 }),
 ]);
 ```
+
+`withTransaction`'s second callback argument is repo-core's `TransactionHandle`.
+SQLite binds its transaction to the **connection**, not to a session object, so
+`uow.session` is always absent — the tx-bound `txRepo` (and `otherRepo.bindToTx(tx.db)`)
+is the join point. The argument exists so code written against the portable contract
+compiles and runs unchanged on both kits.
+
+`capabilities.transactionRetry` is `'caller'`: one `BEGIN … COMMIT` per call, no
+internal re-run. Wrap contended writes in repo-core's `retryingTransaction(repo, fn)`
+to get the retry loop.
+
+## Optimistic concurrency — `ifVersion` CAS
+
+Opt in by naming the version column. There is no default name: SQL has no implicit
+`__v`, and guessing one would bind the guard to whatever a table happened to call
+that column.
+
+```ts
+const orders = new SqliteRepository({ db, table: ordersTable, versionField: 'version' });
+// orders.capabilities.optimisticConcurrency === true
+
+const fresh = await orders.getById('o1');            // { version: 3, ... }
+await orders.update('o1', { status: 'paid' }, { ifVersion: fresh.version });
+// applied only at v3, and the same statement bumps it to v4
+```
+
+The check and the write are one `UPDATE … WHERE id = ? AND version = ?`, so there is
+no read-then-write window. A miss is **disambiguated**, which is the point:
+
+| outcome | result |
+|---|---|
+| row matched at the expected version | returns the updated row, version incremented |
+| row exists at a **different** version | throws `VersionConflictError` (409-shaped, carries `actualVersion`) |
+| row genuinely absent (or outside the injected scope) | returns `null` |
+
+Collapsing the middle case into `null` would read as not-found and invite a blind
+retry that overwrites the concurrent write — so it throws. Two more refusals in the
+same spirit: a `versionField` naming a column that isn't on the table is **fatal at
+construction**, and `ifVersion` on a repository without one **throws** rather than
+silently proceeding unguarded.
+
+`replace()` advances the version rather than NULL-filling it (the stamp is repository
+metadata, not document content) and refuses `ifVersion` — the CAS is defined for
+`update`. For a per-call version column with null-on-miss semantics instead of a
+throw, use `claimVersion({ field, from })`.
 
 ## TTL — three modes
 
@@ -390,3 +435,7 @@ Production-shape API. 154 tests across unit + integration, typecheck-clean, stru
 ## License
 
 MIT.
+
+## Trademark
+
+MIT-licensed code. "Classytic"/"arc" names + logos are trademarks of Classytic LLC — see [TRADEMARK.md](TRADEMARK.md).

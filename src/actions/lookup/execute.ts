@@ -99,7 +99,11 @@ export async function executeLookup<
   }
 
   const data = hydrateLookupRows<TDoc & TExtra>(dataRows, lookups);
-  const pages = countStrategy === 'none' ? 0 : Math.max(1, Math.ceil(total / limit));
+  // Zero rows is zero pages — same rule as `PaginationEngine` and
+  // `aggregatePaginate`. A `Math.max(1, …)` floor here would report `1 / 1`
+  // for an empty join and send a "fetch every page" loop after a page that
+  // cannot exist.
+  const pages = countStrategy === 'none' || total === 0 ? 0 : Math.ceil(total / limit);
 
   return {
     method: 'offset',

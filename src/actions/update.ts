@@ -8,6 +8,7 @@
  * `{ matchedCount, modifiedCount }` envelope.
  */
 
+import { VersionConflictError } from '@classytic/repo-core/errors';
 import { and, eq, getTableColumns, type SQL, sql } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
 import type { SqliteDb } from '../repository/types.js';
@@ -43,6 +44,85 @@ export async function updateById<TDoc>(
   const where = scope ? and(eq(idColumn, id), scope) : eq(idColumn, id);
   const rows = await db.update(table).set(setClause).where(where).returning();
   return (rows[0] as TDoc) ?? null;
+}
+
+/**
+ * Optimistic-concurrency update by primary key — repo-core's
+ * `WriteOptions.ifVersion` contract.
+ *
+ * The version predicate rides IN the UPDATE's WHERE clause, so the check and
+ * the write are one statement: there is no read-then-write window for a
+ * concurrent writer to slip through. The bump rides the same SET clause,
+ * because a versioned write that did NOT advance the version would let the
+ * next writer pass the identical CAS and clobber this one.
+ *
+ * The interesting part is the miss. `UPDATE … WHERE id = ? AND v = ?`
+ * matching nothing is TWO different facts, and collapsing them is the defect
+ * the contract exists to prevent:
+ *
+ *   - the row is **gone** → return `null`, the ordinary not-found miss
+ *   - the row **moved past** `expectedVersion` → throw `VersionConflictError`
+ *
+ * Returning `null` for the second would read as not-found to every caller and
+ * invite the blind retry that overwrites the concurrent write. So the miss is
+ * disambiguated with a follow-up read under the SAME scope — narrower than
+ * the CAS filter by exactly the version predicate, so a row the scope hides
+ * still reports as gone rather than as a conflict.
+ *
+ * The follow-up read is not itself atomic (the row could vanish between the
+ * two statements), and that is fine: the only way to be wrong is to report
+ * `null` for a row that briefly existed, which is the miss answer the caller
+ * would have gotten a microsecond earlier anyway. Callers needing the pair to
+ * be atomic wrap the call in `withTransaction`.
+ */
+export async function updateByIdCas<TDoc>(
+  db: SqliteDb,
+  table: SQLiteTable,
+  idColumn: SQLiteColumn,
+  id: unknown,
+  data: Partial<TDoc>,
+  versionColumn: SQLiteColumn,
+  expectedVersion: number,
+  scope?: SQL,
+): Promise<TDoc | null> {
+  const idName = (idColumn as unknown as { name: string }).name;
+  const versionName = (versionColumn as unknown as { name: string }).name;
+
+  const setClause: Record<string, unknown> = { ...data };
+  delete setClause[idName];
+  // The CAS owns the version column exclusively. A payload that also writes
+  // it produces one of two silent wrongs — the caller's value overrides the
+  // bump (defeating the next CAS) or the bump overrides the caller (an
+  // instruction that vanished). Neither is actionable, so refuse up front.
+  if (versionName in setClause) {
+    throw new Error(
+      `sqlitekit: update({ ifVersion }) payload sets "${versionName}", but the optimistic-` +
+        `concurrency CAS owns that column — it increments it as part of the same write. ` +
+        `Remove it; the EXPECTED version belongs in \`options.ifVersion\`.`,
+    );
+  }
+  // `coalesce` so a nullable version column initialises rather than staying
+  // NULL forever — matches `claimVersion`'s first-write path.
+  setClause[versionName] = sql`coalesce(${versionColumn}, 0) + 1`;
+
+  const casWhere = scope
+    ? and(eq(idColumn, id), eq(versionColumn, expectedVersion), scope)
+    : and(eq(idColumn, id), eq(versionColumn, expectedVersion));
+  const rows = await db.update(table).set(setClause).where(casWhere).returning();
+  const updated = rows[0] as TDoc | undefined;
+  if (updated) return updated;
+
+  const idWhere = scope ? and(eq(idColumn, id), scope) : eq(idColumn, id);
+  const current = await db.select().from(table).where(idWhere).limit(1);
+  const existing = current[0] as Record<string, unknown> | undefined;
+  if (!existing) return null;
+
+  const actual = existing[versionName];
+  throw new VersionConflictError({
+    expectedVersion,
+    ...(typeof actual === 'number' ? { actualVersion: actual } : {}),
+    id: String(id),
+  });
 }
 
 /**
@@ -145,8 +225,11 @@ export async function replaceById<TDoc>(
   id: unknown,
   replacement: Partial<TDoc>,
   scope?: SQL,
+  versionColumn?: SQLiteColumn,
 ): Promise<TDoc | null> {
   const idName = (idColumn as unknown as { name: string }).name;
+  const versionName =
+    versionColumn !== undefined ? (versionColumn as unknown as { name: string }).name : undefined;
   const replacementRecord = { ...(replacement as Record<string, unknown>) };
   // The PK NEVER moves on replace — strip it from the SET clause so a
   // caller passing the same id (or a different id by accident) can't
@@ -160,6 +243,20 @@ export async function replaceById<TDoc>(
   const setClause: Record<string, unknown> = {};
   for (const colName of Object.keys(allColumns)) {
     if (colName === idName) continue;
+    /**
+     * The optimistic-concurrency version is repository METADATA, not part of
+     * the document being replaced — so the NULL-fill must not reach it. On a
+     * `notNull` column that would surface as a constraint error (loud, but
+     * for the wrong reason); on a nullable one it would silently erase the
+     * version, and every subsequent `ifVersion` CAS would compare against
+     * NULL and miss forever — reported to callers as a permanent version
+     * conflict on a row nobody is contending. Replace ADVANCES the version
+     * instead: it is a write, and the next CAS must see that it happened.
+     */
+    if (colName === versionName && versionColumn !== undefined) {
+      setClause[colName] = sql`coalesce(${versionColumn}, 0) + 1`;
+      continue;
+    }
     setClause[colName] = colName in replacementRecord ? replacementRecord[colName] : null;
   }
 
