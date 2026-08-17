@@ -47,6 +47,7 @@ import type {
   DataAdapter,
   RepositoryLike,
 } from '@classytic/repo-core/adapter';
+import { asReadOnlyRepo } from '@classytic/repo-core/repository';
 import type { SchemaGenerator } from '@classytic/repo-core/schema';
 import { sql } from 'drizzle-orm';
 import {
@@ -201,6 +202,25 @@ export interface BetterAuthOverlayOptions<TDoc = Record<string, unknown>> {
    * `@classytic/sqlitekit/schema` to get OpenAPI auto-gen.
    */
   schemaGenerator?: SchemaGenerator<DrizzleTableLike>;
+
+  /**
+   * Return a WRITABLE repository. Default `false` — the overlay is a
+   * read-side projection, and its repository is sealed (`asReadOnlyRepo`):
+   * writes throw, and `capabilities.readOnly` lets a host refuse write
+   * ROUTES at boot.
+   *
+   * Better Auth owns writes to these tables and enforces invariants the rows
+   * cannot: password hashing, session revocation, org membership cascades,
+   * and every plugin hook (passkey, SSO, ...). A generic `POST /users`
+   * through this repository bypasses all of it and writes a row Better Auth
+   * never saw — one `routes: ['create']` away, whenever the repository is
+   * writable, which is why the seal is the default rather than a docstring.
+   *
+   * Set `true` ONLY for administrative repair paths where you have accepted
+   * that responsibility. Normal identity mutations go through `auth.api`.
+   * Mirrors `@classytic/mongokit/better-auth`.
+   */
+  unsafeWritable?: boolean;
 }
 
 /**
@@ -219,6 +239,7 @@ export async function createBetterAuthOverlay<TDoc = Record<string, unknown>>(
     additionalColumns = {},
     RepositoryClass,
     schemaGenerator,
+    unsafeWritable = false,
   } = options;
 
   const ctx = await auth.$context;
@@ -253,7 +274,15 @@ export async function createBetterAuthOverlay<TDoc = Record<string, unknown>>(
       idField: string;
     }) => RepositoryLike<TDoc>);
 
-  const repository = new RepoCtor({ db, table, idField: 'id' });
+  const built = new RepoCtor({ db, table, idField: 'id' });
+  const repository = unsafeWritable
+    ? built
+    : asReadOnlyRepo(built, {
+        reason:
+          `Better Auth owns writes to '${tableConfig.modelName}' (hashing, session revocation, ` +
+          'org cascades, plugin hooks) — mutate via auth.api, not generic CRUD. Pass ' +
+          '`unsafeWritable: true` to this overlay if raw administrative writes are required',
+      });
 
   // `exactOptionalPropertyTypes` rejects `{ schemaGenerator: undefined }`
   // when the target requires non-undefined; spread only when defined.

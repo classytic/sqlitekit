@@ -371,14 +371,66 @@ describe('createBetterAuthOverlay — multi-plugin schema merge', () => {
 // Write path — overlay's Repository.create() persists via Drizzle
 // ============================================================================
 
-describe('createBetterAuthOverlay — write path', () => {
-  it('repository.create writes a row that subsequent reads see', async () => {
+describe('createBetterAuthOverlay — write seal', () => {
+  it('is READ-ONLY by default — writes throw instead of bypassing Better Auth', async () => {
+    // The overlay described itself as a read-side projection while returning a
+    // fully mutable repository, so `defineResource({ routes: ['create'] })`
+    // over `user` was one config line from writing rows Better Auth never
+    // hashed, cascaded, or fired a plugin hook for.
     const r = await setupRigWith([organization()]);
     try {
       const adapter = await createBetterAuthOverlay({
         auth: r.auth,
         db: r.db,
+        collection: 'user',
+      });
+      // biome-ignore lint/suspicious/noExplicitAny: structural Repository for tests.
+      const repo = adapter.repository as any;
+
+      expect(() => repo.create({ id: 'u_x', email: 'attacker@x.com' })).toThrow(/read-only/);
+      expect(() => repo.update('u_x', { role: 'admin' })).toThrow(/auth\.api/);
+      expect(() => repo.delete('u_x')).toThrow(/read-only/);
+      expect(repo.capabilities?.readOnly).toBe(true);
+
+      // Reads — the whole point of the overlay — are untouched.
+      await expect(repo.getAll({})).resolves.toBeTruthy();
+    } finally {
+      r.sqlite.close();
+    }
+  });
+
+  it('seals a method it has never heard of — unknown is refused, not forwarded', async () => {
+    const r = await setupRigWith([organization()]);
+    try {
+      const adapter = await createBetterAuthOverlay({
+        auth: r.auth,
+        db: r.db,
+        collection: 'user',
+      });
+      // biome-ignore lint/suspicious/noExplicitAny: structural Repository for tests.
+      const repo = adapter.repository as any;
+      // `claim` is a kit write verb the seal's read allow-list does not name.
+      if (typeof repo.claim === 'function') {
+        expect(() => repo.claim('u_x', {})).toThrow(/read-only/);
+      }
+    } finally {
+      r.sqlite.close();
+    }
+  });
+});
+
+describe('createBetterAuthOverlay — write path', () => {
+  it('repository.create writes a row that subsequent reads see — under unsafeWritable', async () => {
+    const r = await setupRigWith([organization()]);
+    try {
+      // `unsafeWritable` is REQUIRED now: the overlay seals writes by default
+      // so a host cannot expose generic CRUD over Better Auth's tables by
+      // accident. This covers the administrative-repair path it exists for.
+      const adapter = await createBetterAuthOverlay({
+        auth: r.auth,
+        db: r.db,
         collection: 'organization',
+        unsafeWritable: true,
       });
       // biome-ignore lint/suspicious/noExplicitAny: structural Repository for tests.
       const repo = adapter.repository as any;

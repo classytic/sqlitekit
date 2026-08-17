@@ -7,6 +7,28 @@ adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### ⚠ BREAKING — Better Auth overlay is READ-ONLY by default
+
+`createBetterAuthOverlay` returns a sealed repository: writes throw
+`ReadOnlyRepositoryError`, and `capabilities.readOnly` lets a host (arc) refuse
+write ROUTES at boot. Reads are unchanged.
+
+The overlay described itself as a read-side projection while returning a fully
+mutable repository, so `defineResource({ routes: ['create'] })` over `user` /
+`session` / `account` / `member` was one config line from writing rows Better
+Auth never hashed, cascaded, or fired a plugin hook for. A docstring is not a
+control.
+
+**Who breaks:** any host writing through the overlay. **Fix, in order of
+preference:** route identity mutations through `auth.api`; disable the write
+routes (`disabledRoutes: ['create', 'update', 'delete']`); or, for
+administrative repair only, pass `unsafeWritable: true` and accept the
+invariants Better Auth would otherwise enforce.
+
+Requires `@classytic/repo-core` >=0.23.0 (`asReadOnlyRepo`). Mirrors
+`@classytic/mongokit/better-auth`, which shipped this in 3.33.0 — sqlitekit
+0.8.0 went out without it, so the two kits disagreed until now.
+
 ### Added — optimistic concurrency (`ifVersion` CAS)
 
 - **`new SqliteRepository({ versionField })`** enables repo-core's
