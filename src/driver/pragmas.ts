@@ -72,6 +72,20 @@ export function productionPragmas(): PragmaSet {
  * `synchronous` because no writes happen, and turns on `query_only`
  * to make the safety guarantee explicit at the engine level.
  */
+/**
+ * Every `COMMIT` reaches storage before it returns — for data that must survive a crash or power
+ * loss (a till's sales). Rollback journal, which every VFS supports: WAL needs shared memory or
+ * `locking_mode=EXCLUSIVE` (OPFS `opfs-sahpool`).
+ */
+export function durablePragmas(): PragmaSet {
+  return {
+    journal_mode: 'DELETE',
+    synchronous: 'FULL',
+    foreign_keys: 'ON',
+    temp_store: 'MEMORY',
+  };
+}
+
 export function readOnlyPragmas(): PragmaSet {
   return {
     journal_mode: 'WAL',

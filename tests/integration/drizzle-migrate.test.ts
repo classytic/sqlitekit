@@ -16,7 +16,8 @@ import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { createBetterSqlite3Driver } from '../../src/driver/better-sqlite3.js';
-import { createMigrator, fromDrizzleDir } from '../../src/migrate/index.js';
+import { fromDrizzleDir } from '../../src/migrate/from-drizzle.js';
+import { createMigrator } from '../../src/migrate/index.js';
 import { fixtureMigrationsDir } from '../helpers/fixtures.js';
 
 describe('fromDrizzleDir + createMigrator — fixture migrations', () => {

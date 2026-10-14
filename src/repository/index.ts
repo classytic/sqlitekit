@@ -12,6 +12,7 @@
 
 export { SQLITEKIT_CAPABILITIES } from '../capabilities.js';
 export { type CreateRepositoryConfig, createRepository } from '../create-repository.js';
+export { NestedTransactionError } from './connection-gate.js';
 export {
   type SqliteMiddleware,
   type SqliteMiddlewareContext,

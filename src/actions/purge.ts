@@ -50,6 +50,7 @@ import type { PurgePort, WritingPurgeStrategy } from '@classytic/repo-core/repos
 import { getTableName, sql } from 'drizzle-orm';
 import type { SQLiteColumn, SQLiteTable } from 'drizzle-orm/sqlite-core';
 import { compileFilterToDrizzle } from '../filter/compile.js';
+import { withManualTransaction } from '../repository/transaction.js';
 import type { SqliteDb } from '../repository/types.js';
 
 /**
@@ -386,26 +387,16 @@ async function purgeAnonymizeFunctional(
 
   if (docs.length === 0) return 0;
 
-  // Per-row UPDATE bundled in a single transaction via manual
-  // BEGIN/COMMIT. We can't use Drizzle's `db.transaction(cb)` here: the
-  // better-sqlite3 (sync) driver REJECTS an async callback ("Transaction
-  // function cannot return a promise"), while libsql/D1 require one — no
-  // single callback shape satisfies both. Manual statements via `db.run`
-  // work identically on every driver (sync executes inline; async awaits).
-  await repo.db.run(sql`BEGIN`);
-  try {
+  // Per-row UPDATE in one transaction — the same gated boundary as withTransaction.
+  await withManualTransaction(repo.db, async (tx) => {
     for (const doc of docs) {
       const set: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(fields)) {
         set[k] = typeof v === 'function' ? (v as (d: Record<string, unknown>) => unknown)(doc) : v;
       }
-      await repo.db.update(repo.table).set(set).where(sql`${idCol} = ${doc[idColName]}`);
+      await tx.update(repo.table).set(set).where(sql`${idCol} = ${doc[idColName]}`);
     }
-    await repo.db.run(sql`COMMIT`);
-  } catch (err) {
-    await repo.db.run(sql`ROLLBACK`);
-    throw err;
-  }
+  });
 
   // docs are ordered ascending — advance the keyset past this chunk.
   keyset.cursor = docs[docs.length - 1]?.[idColName] ?? keyset.cursor;

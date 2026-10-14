@@ -5,7 +5,80 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] - 2026-10-13
+
+Peer floor `@classytic/repo-core >=0.31.0`: the kit passes every conformance suite of 0.31 (`fast-check` is a devDependency for the property suites).
+
+### Added — `./driver/sqlite-wasm`: the official SQLite WebAssembly build, for browsers and WebViews
+
+`drizzleSqliteWasm(db, { schema })` and `createSqliteWasmDriver(db, { pragmas })` over an
+`@sqlite.org/sqlite-wasm` `oo1.DB` — typed structurally, so the package gains no dependency. Meant
+for the OPFS `opfs-sahpool` VFS inside a Worker. BLOBs stay `Uint8Array` and 64-bit integers stay
+`bigint` (Drizzle's sql-js driver decodes BLOBs to strings in browsers), and `changes` is read after
+a statement has stepped to completion, so a `RETURNING` write reports it correctly. The shared
+`StandardRepo` conformance suite now runs against this driver as well as better-sqlite3.
+`driver: 'sqlite-wasm'` joins the repository's driver hint.
+
+### Added — `./worker/host` and `./worker/client`: one owner for a browser database
+
+OPFS databases live inside a Worker, and a browser has no async context to fence a transaction
+with. `serveSqliteWorker({ open, units, close })` runs named UNITS of work — never single
+statements — one at a time, to completion, in arrival order; that queue is the transaction
+boundary. `connectSqliteWorker<typeof units>(worker)` gives the page a typed `call(unit, input)`;
+a unit's error arrives as `SqliteWorkerError` with its `name`, `code`, `status` and `details` (which
+structured clone would drop). `claimDatabase(name)` makes one tab the owner through the Web Locks
+API; another tab can `takeOver()`, which asks the owner to release the database first.
+
+One worker serves ONE ownership. `release()` refuses new calls, waits for accepted ones, closes the
+database and terminates the worker; the worker refuses any later call (`sqlite_worker.released`), so
+a tab that handed over cannot write again without reclaiming ownership and starting a new worker. A
+crashed worker (`error`/`messageerror`) or a call's `timeoutMs` fails pending calls with
+`outcome: 'unknown'`: the unit may have committed, so callers reconcile by idempotency key instead
+of running it again. `claimDatabase` ownership has `release()` for unmount.
+
+### ⚠ Changed — `fromDrizzleDir` moved to `./migrate/drizzle-dir`
+
+`./migrate` re-exported `fromDrizzleDir`, which imports `node:fs` and `node:path`, so any browser or
+Worker bundle that imported `createMigrator` failed to build. `./migrate` is now platform-free
+(`createMigrator`, `sqlMigration`, types); import `fromDrizzleDir` from
+`@classytic/sqlitekit/migrate/drizzle-dir` (Node only).
+
+### Added — `durablePragmas()`
+
+`synchronous=FULL` with the rollback journal: every `COMMIT` reaches storage before it returns.
+`productionPragmas()` keeps `synchronous=NORMAL`, which can lose the last commits on power loss.
+
+### ⚠ Fixed — a statement from another flow could land inside an open transaction and be rolled back
+
+`withTransaction` sent `BEGIN`/`COMMIT` on the shared connection with no gate. While its callback
+awaited, a write from ANOTHER async flow on the same connection (a concurrent request) executed
+inside that transaction — and vanished if it rolled back. Nothing threw. A transaction now holds the
+connection exclusively: statements from other flows wait for its commit or rollback, a second
+`withTransaction` queues instead of failing at `BEGIN`, and a nested one throws
+`NestedTransactionError` (exported from `@classytic/sqlitekit/repository`). Inside the callback, the outer repository still joins the transaction.
+The purge port's chunk transaction goes through the same boundary.
+
+"Inside" is tracked with Node's `AsyncLocalStorage` (via `process.getBuiltinModule`, so browser
+bundles are unaffected). Where it is unavailable the gate is a pass-through, and the caller must
+serialize units of work — a single worker owning the connection does. Raw `repo.db` statements
+outside a repository method are not gated.
+
+### ⚠ Fixed — a `null` in an `in` / `nin` list returned wrong rows (often none)
+
+SQL `IN` / `NOT IN` cannot hold NULL: `status NOT IN ('a', NULL)` is unknown for every row, so
+`?status[nin]=null,active` returned NOTHING, and `?status[in]=null,active` never matched a null
+status. A null member is now `IS NULL` for `in` (OR'd with the rest) and dropped from `nin`, which
+already excludes null rows. That is the same meaning every kit and the in-memory matcher give it.
+
+### Changed — `parseUrl` is the shared grammar limited to what SQLite runs
+
+`parseUrl` reads through repo-core's shared list-query grammar: closed operators, literal text
+operators, 400s instead of dropped input. It now defaults `allowedOperators` to
+`SQLITE_URL_OPERATORS`, which is everything except `regex`/`options`. SQLite ships no REGEXP, so a
+`?field[regex]=` is a 400 at parse time instead of a 500 at query time. A host that registered
+REGEXP on its driver passes `allowedOperators` to opt in. The new
+`tests/integration/query-grammar-conformance.test.ts` runs repo-core's
+`runQueryGrammarConformance` against a real SQLite database.
 
 ### ⚠ BREAKING — Better Auth overlay is READ-ONLY by default
 

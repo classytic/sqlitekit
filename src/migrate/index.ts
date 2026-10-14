@@ -6,7 +6,6 @@
  * use drizzle-kit or a future `@classytic/sqlitekit-migrate`.
  */
 
-export { type FromDrizzleDirOptions, fromDrizzleDir } from './from-drizzle.js';
 export { createMigrator, sqlMigration } from './migrator.js';
 export type {
   AppliedMigration,

@@ -13,7 +13,8 @@ import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createBetterSqlite3Driver } from '../../src/driver/better-sqlite3.js';
-import { createMigrator, fromDrizzleDir } from '../../src/migrate/index.js';
+import { fromDrizzleDir } from '../../src/migrate/from-drizzle.js';
+import { createMigrator } from '../../src/migrate/index.js';
 import {
   createVectorTableSql,
   loadVectorExtension,

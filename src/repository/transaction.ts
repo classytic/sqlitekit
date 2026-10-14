@@ -10,12 +10,13 @@
  * supported uniformly on better-sqlite3, libsql, expo-sqlite, and
  * bun:sqlite.
  *
- * Single-writer assumption: SQLite is single-writer per database, so
- * sequential `await db.run(...)` calls between BEGIN and COMMIT all
- * land on the same transaction without explicit handle threading.
+ * The transaction holds the connection exclusively (`connection-gate.ts`):
+ * statements from other async flows wait for the COMMIT/ROLLBACK instead of
+ * landing inside it, and a second transaction queues instead of failing.
  */
 
 import { sql } from 'drizzle-orm';
+import { connectionGate } from './connection-gate.js';
 import type { SqliteDb } from './types.js';
 
 /**
@@ -32,19 +33,19 @@ export async function withManualTransaction<T>(
   db: SqliteDb,
   fn: (tx: SqliteDb) => Promise<T>,
 ): Promise<T> {
-  await db.run(sql`BEGIN`);
-  try {
-    const result = await fn(db);
-    await db.run(sql`COMMIT`);
-    return result;
-  } catch (err) {
+  return connectionGate(db).exclusive(async () => {
+    await db.run(sql`BEGIN`);
     try {
-      await db.run(sql`ROLLBACK`);
-    } catch {
-      // ROLLBACK can fail if BEGIN never landed (e.g., the BEGIN itself
-      // raised). That's a best-effort cleanup — surface the original
-      // error rather than masking it with a rollback failure.
+      const result = await fn(db);
+      await db.run(sql`COMMIT`);
+      return result;
+    } catch (err) {
+      try {
+        await db.run(sql`ROLLBACK`);
+      } catch {
+        // ROLLBACK fails when BEGIN never landed — surface the original error, not this one.
+      }
+      throw err;
     }
-    throw err;
-  }
+  });
 }

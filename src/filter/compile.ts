@@ -99,17 +99,25 @@ export function compileFilterToDrizzle(
     case 'lte':
       return lte(lookup(filter.field), filter.value);
 
+    // SQL `IN` / `NOT IN` cannot hold NULL: `x IN (NULL)` never matches and `x NOT IN (a, NULL)`
+    // matches NOTHING. A null member means IS NULL for `in`; `nin` already excludes null rows
+    // (three-valued logic), so its null member is simply dropped.
     case 'in': {
       // Empty IN-set matches nothing — return contradiction so callers
       // don't accidentally widen the result by dropping the predicate.
       if (filter.values.length === 0) return sql`1 = 0`;
-      return inArray(lookup(filter.field), [...filter.values]);
+      const col = lookup(filter.field);
+      const values = filter.values.filter((v) => v !== null && v !== undefined);
+      if (values.length === filter.values.length) return inArray(col, [...values]);
+      return values.length === 0 ? isNull(col) : or(inArray(col, [...values]), isNull(col));
     }
     case 'nin': {
       // Empty NOT-IN matches everything — `undefined` lets the caller
       // omit the WHERE rather than emit `1 = 1`.
       if (filter.values.length === 0) return undefined;
-      return notInArray(lookup(filter.field), [...filter.values]);
+      const col = lookup(filter.field);
+      const values = filter.values.filter((v) => v !== null && v !== undefined);
+      return values.length === 0 ? isNotNull(col) : notInArray(col, [...values]);
     }
 
     case 'exists':

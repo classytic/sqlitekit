@@ -19,11 +19,18 @@
 
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import sqlite3InitModule from '@sqlite.org/sqlite-wasm';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { createBetterSqlite3Driver } from '../../src/driver/better-sqlite3.js';
+import {
+  createSqliteWasmDriver,
+  drizzleSqliteWasm,
+  type SqliteWasmDatabase,
+} from '../../src/driver/sqlite-wasm.js';
 import type { SqliteDriver } from '../../src/driver/types.js';
-import { createMigrator, fromDrizzleDir } from '../../src/migrate/index.js';
+import { fromDrizzleDir } from '../../src/migrate/from-drizzle.js';
+import { createMigrator } from '../../src/migrate/index.js';
 import type { SqliteDb } from '../../src/repository/types.js';
 import {
   conformanceTable,
@@ -64,24 +71,42 @@ export async function makeFixtureDb(): Promise<TestDb> {
   const migrator = createMigrator({ driver, migrations });
   await migrator.up();
   const db = drizzle(raw, {
-    schema: {
-      users: usersTable,
-      tasks: tasksTable,
-      sessions: sessionsTable,
-      conformance: conformanceTable,
-      departments: departmentsTable,
-      employees: employeesTable,
-      employee_tasks: employeeTasksTable,
-      posts: postsTable,
-      runs: runsTable,
-      versioned_orders: versionedOrdersTable,
-      outbox: outboxLeaseTable,
-    },
+    schema: FIXTURE_SCHEMA,
   }) as unknown as SqliteDb;
   return {
     db,
     driver,
     raw,
+    close: () => raw.close(),
+  };
+}
+
+const FIXTURE_SCHEMA = {
+  users: usersTable,
+  tasks: tasksTable,
+  sessions: sessionsTable,
+  conformance: conformanceTable,
+  departments: departmentsTable,
+  employees: employeesTable,
+  employee_tasks: employeeTasksTable,
+  posts: postsTable,
+  runs: runsTable,
+  versioned_orders: versionedOrdersTable,
+  outbox: outboxLeaseTable,
+};
+
+let sqlite3: ReturnType<typeof sqlite3InitModule> | undefined;
+
+/** The same fixture over the official sqlite-wasm build (in memory) — proves the browser driver. */
+export async function makeWasmFixtureDb(): Promise<Pick<TestDb, 'db' | 'driver' | 'close'>> {
+  sqlite3 ??= sqlite3InitModule();
+  const raw = new (await sqlite3).oo1.DB(':memory:') as unknown as SqliteWasmDatabase;
+  const driver = createSqliteWasmDriver(raw);
+  const migrations = await fromDrizzleDir({ dir: FIXTURE_MIGRATIONS_DIR });
+  await createMigrator({ driver, migrations }).up();
+  return {
+    db: drizzleSqliteWasm(raw, { schema: FIXTURE_SCHEMA }),
+    driver,
     close: () => raw.close(),
   };
 }

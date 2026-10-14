@@ -105,6 +105,7 @@ import {
 import { type BatchItem, type RepoBatchBuilder, withBatch } from '../batch/batch.js';
 import { SQLITEKIT_CAPABILITIES } from '../capabilities.js';
 import { compileFilterToDrizzle } from '../filter/compile.js';
+import { connectionGate } from './connection-gate.js';
 import { PaginationEngine, type SortKey } from './pagination/PaginationEngine.js';
 import { withManualTransaction } from './transaction.js';
 import type { SqliteDb } from './types.js';
@@ -200,7 +201,7 @@ export interface SqliteRepositoryOptions<TTable extends SQLiteTable = SQLiteTabl
    * aware hosts branch at boot instead of catching a runtime throw.
    * Default: `'better-sqlite3'`-class behavior (transactions on).
    */
-  driver?: 'better-sqlite3' | 'libsql' | 'expo' | 'bun' | 'd1';
+  driver?: 'better-sqlite3' | 'libsql' | 'expo' | 'bun' | 'd1' | 'sqlite-wasm';
   /**
    * Column carrying the optimistic-concurrency version for
    * `update(id, data, { ifVersion })` CAS writes.
@@ -576,7 +577,7 @@ export class SqliteRepository<
         // this serves. `retryPolicy` / `signal` read from the context
         // because every op spreads its options bag into `_buildContext`.
         const { retryPolicy, signal } = this.#resilience(context);
-        const result = await withRetry(fn, retryPolicy, signal);
+        const result = await this.#roundTrip(fn, retryPolicy, signal);
         await this._emitAfter(op, context, result);
         return result;
       } catch (err) {
@@ -584,6 +585,15 @@ export class SqliteRepository<
         throw err;
       }
     });
+  }
+
+  /** One driver round trip (with its retries), kept out of another flow's open transaction. */
+  #roundTrip<T>(
+    fn: () => Promise<T>,
+    retryPolicy: RetryPolicy | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<T> {
+    return connectionGate(this.db).outside(() => withRetry(fn, retryPolicy, signal));
   }
 
   /** Pull the repo-core resilience knobs out of a hook context (options spread in at `_buildContext`). */
@@ -797,7 +807,7 @@ export class SqliteRepository<
       }
       const scope = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
       const scopeWhere = compileFilterToDrizzle(scope, this.table);
-      const removed = await withRetry(
+      const removed = await this.#roundTrip(
         () => deleteActions.deleteById(this.db, this.table, this.idColumn, id, scopeWhere),
         retryPolicy,
         signal,
@@ -845,7 +855,7 @@ export class SqliteRepository<
     const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
     const where = compileFilterToDrizzle(f, this.table);
     const { retryPolicy, signal } = this.#resilience(context);
-    const result = await withRetry(
+    const result = await this.#roundTrip(
       () => readActions.count(this.db, this.table, where),
       retryPolicy,
       signal,
@@ -862,7 +872,7 @@ export class SqliteRepository<
     const f = this.#asFilter(context.query as Filter | Record<string, unknown> | undefined);
     const where = compileFilterToDrizzle(f, this.table);
     const { retryPolicy, signal } = this.#resilience(context);
-    const result = await withRetry(
+    const result = await this.#roundTrip(
       () => readActions.exists(this.db, this.table, where),
       retryPolicy,
       signal,
@@ -883,7 +893,7 @@ export class SqliteRepository<
     // Hooks may override via `context['limit']`; fall back to the caller's value.
     const limit = (context['limit'] as number | undefined) ?? options.limit;
     const { retryPolicy, signal } = this.#resilience(context);
-    const result = await withRetry(
+    const result = await this.#roundTrip(
       () => readActions.findAll<TDoc>(this.db, this.table, where, undefined, limit),
       retryPolicy,
       signal,
@@ -1515,7 +1525,7 @@ export class SqliteRepository<
       );
     }
     const { retryPolicy, signal } = this.#resilience(context);
-    const result = await withRetry(
+    const result = await this.#roundTrip(
       () =>
         updateActions.updateMany(
           this.db,
@@ -1675,7 +1685,7 @@ export class SqliteRepository<
       );
     }
     const { retryPolicy, signal } = this.#resilience(context);
-    const deletedCount = await withRetry(
+    const deletedCount = await this.#roundTrip(
       () => deleteActions.deleteMany(this.db, this.table, this.idColumn, where),
       retryPolicy,
       signal,
@@ -1723,7 +1733,7 @@ export class SqliteRepository<
     const context = await this._buildContext('upsert', { data, ...options });
     const payload = (context.data ?? data) as Partial<TDoc>;
     const { retryPolicy, signal } = this.#resilience(context);
-    const result = await withRetry(
+    const result = await this.#roundTrip(
       () => createActions.upsert<TDoc>(this.db, this.table, this.idColumn, payload),
       retryPolicy,
       signal,
@@ -2149,7 +2159,7 @@ export class SqliteRepository<
   ): Promise<T[]> {
     const f = this.#asFilter(filter);
     const where = compileFilterToDrizzle(f, this.table);
-    return withRetry(
+    return this.#roundTrip(
       () => readActions.distinct<T>(this.db, this.table, this.#col(field), where),
       options.retryPolicy,
       options.signal,

@@ -7,6 +7,7 @@
  */
 
 export {
+  durablePragmas,
   type PragmaSet,
   productionPragmas,
   readOnlyPragmas,

@@ -35,7 +35,8 @@ import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 import { createRepository } from '@classytic/sqlitekit/repository';
 import { createBetterSqlite3Driver } from '@classytic/sqlitekit/driver/better-sqlite3';
 import { productionPragmas } from '@classytic/sqlitekit/driver/pragmas';
-import { createMigrator, fromDrizzleDir } from '@classytic/sqlitekit/migrate';
+import { createMigrator } from '@classytic/sqlitekit/migrate';
+import { fromDrizzleDir } from '@classytic/sqlitekit/migrate/drizzle-dir';
 import { and, eq, gt } from '@classytic/repo-core/filter';
 
 // 1. Define your schema with Drizzle.
@@ -142,7 +143,8 @@ export default {
 | `@classytic/sqlitekit/batch` | `withBatch` (cross-repo atomic writes), `RepoBatchBuilder`, `BatchItem` |
 | `@classytic/sqlitekit/filter` | `compileFilterToDrizzle` (Filter IR → Drizzle predicate) |
 | `@classytic/sqlitekit/schema` | `createIndex`, `dropIndex`, `reindex`, `listIndexes`, `IndexInfo` |
-| `@classytic/sqlitekit/migrate` | `createMigrator`, `sqlMigration`, `fromDrizzleDir` |
+| `@classytic/sqlitekit/migrate` | `createMigrator`, `sqlMigration` (platform-free) |
+| `@classytic/sqlitekit/migrate/drizzle-dir` | `fromDrizzleDir` (reads the filesystem — Node only) |
 | `@classytic/sqlitekit/actions` | `create`, `read`, `update`, `delete`, `aggregate` modules — pure data-access primitives the repo class composes |
 | `@classytic/sqlitekit/driver` | `SqliteDriver` interface + `productionPragmas`, `readOnlyPragmas`, `testPragmas` |
 | `@classytic/sqlitekit/driver/better-sqlite3` | `createBetterSqlite3Driver` |
@@ -393,7 +395,8 @@ const indexes = await listIndexes(driver, 'users');  // runtime introspection
 Sqlitekit reads the migration directory `drizzle-kit generate` produces — no separate format to learn.
 
 ```ts
-import { createMigrator, fromDrizzleDir } from '@classytic/sqlitekit/migrate';
+import { createMigrator } from '@classytic/sqlitekit/migrate';
+import { fromDrizzleDir } from '@classytic/sqlitekit/migrate/drizzle-dir';
 
 const migrations = await fromDrizzleDir({ dir: './migrations' });
 const migrator = createMigrator({ driver, migrations });

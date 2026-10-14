@@ -22,15 +22,18 @@ import {
 import { SQLITEKIT_CAPABILITIES } from '../../src/capabilities.js';
 import { SqliteRepository } from '../../src/repository/index.js';
 import { conformanceTable } from '../fixtures/drizzle-schema.js';
-import { makeFixtureDb, type TestDb } from '../helpers/fixtures.js';
+import { makeFixtureDb, makeWasmFixtureDb } from '../helpers/fixtures.js';
 
 /**
  * Harness factory. A fresh `:memory:` database is created per test
  * (`better-sqlite3` opens synchronously, teardown is free), so no
  * test can leak state into the next.
  */
-const harness: ConformanceHarness<ConformanceDoc> = {
-  name: 'sqlitekit (better-sqlite3)',
+const harness = (
+  name: string,
+  makeDb: typeof makeWasmFixtureDb,
+): ConformanceHarness<ConformanceDoc> => ({
+  name,
   idField: 'id',
   // `ConformanceFeatures` is an alias of `RepoCapabilities` (repo-core
   // 0.6.0) — the kit's runtime capability constant IS the feature
@@ -51,7 +54,7 @@ const harness: ConformanceHarness<ConformanceDoc> = {
   // the scenario is "not-found stays null", not "invalid id".
   missingId: 'doc_definitely_missing',
   async setup() {
-    const db: TestDb = await makeFixtureDb();
+    const db = await makeDb();
     const repo = new SqliteRepository<ConformanceDoc>({
       db: db.db,
       table: conformanceTable,
@@ -99,6 +102,7 @@ const harness: ConformanceHarness<ConformanceDoc> = {
       ...overrides,
     };
   },
-};
+});
 
-runStandardRepoConformance(harness);
+runStandardRepoConformance(harness('sqlitekit (better-sqlite3)', makeFixtureDb));
+runStandardRepoConformance(harness('sqlitekit (sqlite-wasm)', makeWasmFixtureDb));
