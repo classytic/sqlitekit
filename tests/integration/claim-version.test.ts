@@ -258,3 +258,62 @@ describe('SqliteRepository.claimVersion — optimistic-concurrency CAS', () => {
     });
   });
 });
+
+describe('SqliteRepository.claimVersion — configured versionField', () => {
+  let db: TestDb;
+
+  beforeEach(async () => {
+    db = await makeFixtureDb();
+  });
+  afterEach(() => db.close());
+
+  // `reads` stands in for a version column with a non-default name (`rev`,
+  // `__v`, ...): the fixture table carries both it and `version`, so the
+  // assertions can tell which column the CAS actually used.
+  it('defaults to the repository versionField when the call names no field', async () => {
+    const repo = new SqliteRepository<IOrder>({
+      db: db.db,
+      table: versionedOrdersTable,
+      versionField: 'reads',
+    });
+    const created = await repo.create(makeOrder({ version: 0, reads: 3 }));
+
+    const won = await repo.claimVersion(created.id, { from: 3 }, { status: 'submitted' });
+    expect(won?.reads).toBe(4);
+    expect(won?.version).toBe(0);
+    expect(won?.status).toBe('submitted');
+
+    // Stale stamp on the configured column → null (race-loss), row untouched.
+    expect(await repo.claimVersion(created.id, { from: 3 }, { status: 'x' })).toBeNull();
+    expect((await repo.getById(created.id))?.status).toBe('submitted');
+  });
+
+  it('shares the column with update({ ifVersion })', async () => {
+    const repo = new SqliteRepository<IOrder>({
+      db: db.db,
+      table: versionedOrdersTable,
+      versionField: 'reads',
+    });
+    const created = await repo.create(makeOrder({ reads: 0 }));
+    const claimed = await repo.claimVersion(created.id, { from: 0 }, { total: 1 });
+    expect(claimed?.reads).toBe(1);
+    const updated = await repo.update(created.id, { total: 2 }, { ifVersion: 1 });
+    expect(updated?.total).toBe(2);
+  });
+
+  it('an explicit field still wins over the configured versionField', async () => {
+    const repo = new SqliteRepository<IOrder>({
+      db: db.db,
+      table: versionedOrdersTable,
+      versionField: 'reads',
+    });
+    const created = await repo.create(makeOrder({ version: 7, reads: 0 }));
+    const result = await repo.claimVersion(
+      created.id,
+      { field: 'version', from: 7 },
+      { status: 'submitted' },
+    );
+    expect(result?.version).toBe(8);
+    expect(result?.reads).toBe(0);
+  });
+});

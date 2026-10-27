@@ -216,8 +216,9 @@ export interface SqliteRepositoryOptions<TTable extends SQLiteTable = SQLiteTabl
    * against a non-existent column is a wiring bug, and discovering it on the
    * first concurrent write is discovering it in production.
    *
-   * Distinct from `claimVersion({ field })`, which takes its version column
-   * per call and returns `null` on a miss. `ifVersion` is the repo-core
+   * Also the default column for `claimVersion()` when the call passes no
+   * `field` (otherwise repo-core's `'version'`). `claimVersion` returns
+   * `null` on a miss; `ifVersion` is the repo-core
    * contract: it THROWS `VersionConflictError` on a stale version and stays
    * `null` only for a genuinely absent row.
    */
@@ -892,9 +893,21 @@ export class SqliteRepository<
     // Forward optional `limit` from FindAllOptions through to the action.
     // Hooks may override via `context['limit']`; fall back to the caller's value.
     const limit = (context['limit'] as number | undefined) ?? options.limit;
+    // `sort` follows the same override rule. No sort → natural order (no
+    // ORDER BY), per the FindAllOptions contract. ORDER BY is applied
+    // before LIMIT, so `{ sort: { seq: -1 }, limit: 1 }` yields the max.
+    const sort = (context['sort'] ?? options.sort) as
+      | PaginationParams<TDoc>['sort']
+      | Record<string, 1 | -1>
+      | undefined;
+    const hasSort =
+      typeof sort === 'string' ? sort.trim().length > 0 : !!sort && Object.keys(sort).length > 0;
+    const orderBy = hasSort
+      ? this.#asSortKeys(sort).map((s) => (s.direction === 'asc' ? asc(s.column) : desc(s.column)))
+      : undefined;
     const { retryPolicy, signal } = this.#resilience(context);
     const result = await this.#roundTrip(
-      () => readActions.findAll<TDoc>(this.db, this.table, where, undefined, limit),
+      () => readActions.findAll<TDoc>(this.db, this.table, where, orderBy, limit),
       retryPolicy,
       signal,
     );
@@ -1285,7 +1298,10 @@ export class SqliteRepository<
     update: Record<string, unknown>,
     options: WriteOptions = {},
   ): Promise<TDoc | null> {
-    const versionField = transition.field ?? 'version';
+    // Explicit `field` > the repository's configured `versionField` >
+    // repo-core's documented default `'version'`. A repository that names
+    // its version column shouldn't make every CAS call site repeat it.
+    const versionField = transition.field ?? this.versionField ?? 'version';
     const versionStep = transition.by ?? 1;
     const versionColumn = this.columns[versionField];
     if (!versionColumn) {
@@ -2614,9 +2630,15 @@ export class SqliteRepository<
         });
       return parts.length > 0 ? parts : [{ column: this.idColumn, direction: 'asc' }];
     }
+    // Mongo-style directions: 1 / -1 and 'asc' / 'desc' / 'ascending' /
+    // 'descending'. (Previously anything but `1` meant desc, so 'asc' sorted
+    // descending.)
     return Object.entries(sort).map(([field, direction]) => ({
       column: this.#col(field),
-      direction: direction === 1 ? ('asc' as const) : ('desc' as const),
+      direction:
+        direction === -1 || (typeof direction === 'string' && /^desc/i.test(direction))
+          ? ('desc' as const)
+          : ('asc' as const),
     }));
   }
 

@@ -6,6 +6,7 @@ export default defineConfig({
     'driver/index': 'src/driver/index.ts',
     'driver/better-sqlite3': 'src/driver/better-sqlite3.ts',
     'driver/d1': 'src/driver/d1.ts',
+    'driver/expo-sqlite': 'src/driver/expo-sqlite.ts',
     'driver/sqlite-wasm': 'src/driver/sqlite-wasm.ts',
     'worker/host': 'src/worker/host.ts',
     'worker/client': 'src/worker/client.ts',

@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-10-27
+
+### Fixed — `findAll` ignored `sort`
+
+- `findAll(filter, { sort, limit })` now applies `sort` (object `{ f: 1 | -1 }` or `'-f,g'` string, hook-overridable via `context.sort`) as ORDER BY before LIMIT; previously it returned natural order, so `{ sort: { seq: -1 }, limit: 1 }` gave the oldest row. Object sort values `'asc'`/`'desc'` are now read correctly (`'asc'` used to sort descending).
+
+### Added — array membership and nested paths in filters on JSON columns
+
+Filter leaves on a JSON TEXT column (`text(col, { mode: 'json' })`) now follow repo-core's
+`matchFilter` / mongokit semantics. A scalar condition matches when ANY array element satisfies it
+(`eq('tags', 'x')`, `anyOf('tags', [...])`, `gt('scores', 90)`). A dotted path reads into the document
+(`eq('options.userInvocable', true)`, `exists('options.flag', false)`), fanning out over arrays of
+objects (`items.sku`), and a numeric segment is also tried as an index. Comparisons check the JSON
+type, so `1` never equals `'1'` or `true`. An array operand on `eq` still matches the whole array
+exactly. A dotted path into a non-JSON column throws. Compiled with JSON1 (`json_type` / `json_extract` / `json_each`).
+
+### ⚠ Changed — on a JSON column, `in` / `nin` / `ne` / range filters with a scalar operand now test each array element
+
+Before this change they compared the column's whole JSON text, so they never matched an array.
+
+### Changed — `claimVersion()` defaults to the repository's `versionField`
+
+The column is the call's `field` if given, then the configured `versionField`, then `'version'`.
+
+### Added — `@classytic/sqlitekit/driver/expo-sqlite`
+
+A driver for expo-sqlite (Expo SDK 52+ async API), typed structurally against the slice of `SQLiteDatabase` it uses, so sqlitekit takes no dependency on `expo-sqlite` and Node bundles never see it. Transactions use `withExclusiveTransactionAsync` where it exists; otherwise (expo-sqlite on web) it falls back to `BEGIN`/`COMMIT` behind an in-driver queue so concurrent calls cannot interleave with an open transaction.
+
+### Changed — peer floors to the latest published
+
+`@classytic/repo-core >=0.34.0` (its conformance suite now checks `findAll` sort + limit, which the fix above satisfies), `better-sqlite3 >=13.0.3`, `drizzle-orm >=0.45.4`.
+
 ## [0.10.0] - 2026-10-13
 
 Peer floor `@classytic/repo-core >=0.31.0`: the kit passes every conformance suite of 0.31 (`fast-check` is a devDependency for the property suites).

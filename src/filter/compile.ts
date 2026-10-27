@@ -76,6 +76,15 @@ export function compileFilterToDrizzle(
   resolver?: ColumnResolver,
 ): SQL | undefined {
   const lookup: ColumnResolver = resolver ?? ((field: string) => column(table, field));
+
+  // Leaf ops on a JSON column — or a dotted path INTO one — take the
+  // JSON-document semantics (array membership, nested paths); see
+  // `compileJsonLeaf`. Plain scalar columns keep the native ops below.
+  if ('field' in filter) {
+    const target = resolveJsonTarget(filter.field, table, resolver);
+    if (target !== undefined) return compileJsonLeaf(filter, target);
+  }
+
   switch (filter.op) {
     case 'true':
       return undefined;
@@ -206,6 +215,289 @@ function column(table: SQLiteTable, fieldName: string): AnyColumn {
     );
   }
   return col as AnyColumn;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// JSON columns — array membership + nested paths
+// ──────────────────────────────────────────────────────────────────────
+//
+// repo-core's reference evaluator (`matchFilter`) and mongokit agree on
+// document semantics for a field that holds structured data:
+//
+//   - A scalar condition on an ARRAY value matches when ANY element
+//     satisfies it: `eq('tags', 'x')`, `in('tags', ['x', 'y'])`,
+//     `gt('scores', 90)`. An array operand on `eq` / `in` still matches
+//     the whole array exactly (`eq('tags', ['a', 'b'])`).
+//   - A dotted path walks into the document: `eq('options.flag', true)`,
+//     fanning out over arrays on the way (`items.sku` reaches every
+//     element's `sku`); a numeric segment is also tried as an index.
+//   - `exists` / `eq null` / `ne` / `nin` follow three-valued logic: a
+//     value that is missing or JSON null is "absent", and absent values
+//     are never `ne` / `nin` anything.
+//
+// On SQLite that data lives in JSON TEXT columns (Drizzle
+// `text(col, { mode: 'json' })`), so these leaves compile to JSON1:
+// `json_type` / `json_extract` for a value, `json_each` for array
+// fan-out. Every comparison is TYPE-guarded on the JSON type, so `1`
+// never equals `'1'` or `true`, and `'abc' > 5` is false (bare SQLite
+// orders every TEXT above every INTEGER). Paths and values are bound
+// parameters; nothing caller-supplied is spliced into the SQL text.
+//
+// BLOB-mode JSON columns are NOT treated as JSON documents: SQLite ≥3.45
+// reads a BLOB argument to the JSON functions as JSONB, not JSON text.
+
+/** A leaf whose field resolves into a JSON document. */
+interface JsonTarget {
+  /** The JSON TEXT column holding the document. */
+  readonly col: AnyColumn;
+  /** Path segments below the column (`[]` = the column value itself). */
+  readonly segments: readonly string[];
+}
+
+type LeafFilter = Extract<Filter, { readonly field: string }>;
+
+/** `(value, jsonType) → predicate` — one JSON value and its `json_type` name. */
+type JsonPredicate = (value: SQL, type: SQL) => SQL;
+
+/**
+ * Path depth cap. Each intermediate segment can fan out over an array,
+ * which doubles the emitted SQL — six levels is far beyond any real
+ * document filter and keeps the statement bounded.
+ */
+const MAX_JSON_PATH_SEGMENTS = 6;
+
+function isJsonColumn(col: unknown): boolean {
+  return (col as { columnType?: unknown } | null)?.columnType === 'SQLiteTextJson';
+}
+
+/**
+ * Resolve a leaf field to a JSON target, or `undefined` when the field
+ * is a plain scalar column (the native compiler handles it).
+ *
+ * With a custom `resolver` (aggregate dotted ALIAS paths), the dot is
+ * the resolver's — only a resolved JSON column switches to membership
+ * semantics. Without one, an exact column key wins; otherwise
+ * `head.rest` must name a JSON column `head`.
+ */
+function resolveJsonTarget(
+  field: string,
+  table: SQLiteTable,
+  resolver: ColumnResolver | undefined,
+): JsonTarget | undefined {
+  if (resolver) {
+    const col = resolver(field);
+    return isJsonColumn(col) ? { col, segments: [] } : undefined;
+  }
+  const columns = table as unknown as Record<string, unknown>;
+  const direct = columns[field];
+  if (direct !== undefined && direct !== null) {
+    return isJsonColumn(direct) ? { col: direct as AnyColumn, segments: [] } : undefined;
+  }
+  const dot = field.indexOf('.');
+  if (dot <= 0) return undefined;
+  const head = field.slice(0, dot);
+  const headCol = columns[head];
+  if (headCol === undefined || headCol === null) return undefined;
+  if (!isJsonColumn(headCol)) {
+    throw new Error(
+      `sqlitekit/filter: nested path "${field}" reads into column "${head}", which is not a JSON column. ` +
+        "Dotted paths need a `text(col, { mode: 'json' })` column.",
+    );
+  }
+  const segments = field.slice(dot + 1).split('.');
+  if (segments.length > MAX_JSON_PATH_SEGMENTS) {
+    throw new Error(
+      `sqlitekit/filter: nested path "${field}" is deeper than ${MAX_JSON_PATH_SEGMENTS} segments.`,
+    );
+  }
+  for (const segment of segments) {
+    if (segment.length === 0 || segment.includes('"')) {
+      throw new Error(
+        `sqlitekit/filter: nested path "${field}" has an empty or double-quoted segment, ` +
+          'which a SQLite JSON path cannot address.',
+      );
+    }
+  }
+  return { col: headCol as AnyColumn, segments };
+}
+
+/** Compile one leaf against a JSON target. */
+function compileJsonLeaf(filter: LeafFilter, target: JsonTarget): SQL {
+  switch (filter.op) {
+    case 'eq':
+      return filter.value === null
+        ? not(jsonPresent(target))
+        : jsonSome(target, equalsPredicate(filter.field, filter.value));
+    case 'ne':
+      if (filter.value === null) return jsonPresent(target);
+      return and(
+        jsonPresent(target),
+        not(jsonSome(target, equalsPredicate(filter.field, filter.value))),
+      ) as SQL;
+    case 'gt':
+    case 'gte':
+    case 'lt':
+    case 'lte':
+      return jsonSome(target, comparePredicate(filter.field, filter.op, filter.value));
+    case 'in': {
+      if (filter.values.length === 0) return sql`1 = 0`;
+      const values = filter.values.filter((v) => v !== null && v !== undefined);
+      const hasNull = values.length !== filter.values.length;
+      const member =
+        values.length > 0 ? jsonSome(target, anyEqualsPredicate(filter.field, values)) : undefined;
+      if (!hasNull) return member as SQL;
+      const absent = not(jsonPresent(target));
+      return member === undefined ? absent : (or(member, absent) as SQL);
+    }
+    case 'nin': {
+      const values = filter.values.filter((v) => v !== null && v !== undefined);
+      if (values.length === 0) return jsonPresent(target);
+      return and(
+        jsonPresent(target),
+        not(jsonSome(target, anyEqualsPredicate(filter.field, values))),
+      ) as SQL;
+    }
+    case 'exists':
+      return filter.exists ? jsonPresent(target) : not(jsonPresent(target));
+    case 'like': {
+      const pattern = filter.pattern;
+      const sensitive = filter.caseSensitivity === 'sensitive';
+      return jsonSome(target, (v, t) =>
+        sensitive
+          ? sql`(${t} = 'text' and ${v} like ${pattern} escape '\\')`
+          : sql`(${t} = 'text' and lower(${v}) like lower(${pattern}) escape '\\')`,
+      );
+    }
+    case 'regex':
+      throw new Error(
+        `sqlitekit/filter: regex on field "${filter.field}" requires REGEXP support. ` +
+          'Load an extension or register a REGEXP function on your driver, then use a `raw` filter.',
+      );
+  }
+}
+
+/**
+ * "Some value reached by the path satisfies `pred`" — element-wise over
+ * a leaf array (plus the array itself, for whole-array `eq`).
+ */
+function jsonSome(target: JsonTarget, pred: JsonPredicate): SQL {
+  const walked = walkJson(target.col, '$', target.segments, 0, 0, (doc, path, depth) => {
+    const alias = sql.raw(`je${depth}`);
+    const value = sql`json_extract(${doc}, ${path})`;
+    const type = sql`json_type(${doc}, ${path})`;
+    return sql`(case ${type} when 'array' then (${pred(value, sql`'array'`)} or exists (select 1 from json_each(${doc}, ${path}) as ${alias} where ${pred(sql`${alias}.value`, sql`${alias}.type`)})) else ${pred(value, type)} end)`;
+  });
+  return sql`coalesce(${walked}, 0)`;
+}
+
+/**
+ * "The path reaches a present (non-null) value." The column itself
+ * (no path) keeps a plain `IS NOT NULL` — index-friendly, and it never
+ * parses a value.
+ */
+function jsonPresent(target: JsonTarget): SQL {
+  if (target.segments.length === 0) return isNotNull(target.col);
+  const walked = walkJson(target.col, '$', target.segments, 0, 0, (doc, path) => {
+    const type = sql`json_type(${doc}, ${path})`;
+    return sql`(${type} is not null and ${type} <> 'null')`;
+  });
+  return sql`coalesce(${walked}, 0)`;
+}
+
+/**
+ * Walk `segments` from `path` inside the JSON document `doc`, calling
+ * `leaf(doc, path, depth)` where the path ends. At each intermediate
+ * segment the node is either descended into (object) or fanned out
+ * over (array: every OBJECT element, plus the positional element when
+ * the segment is an index). `depth` names the `json_each` aliases so a
+ * nested subquery never shadows the one it reads from.
+ */
+function walkJson(
+  doc: SQL | AnyColumn,
+  path: string,
+  segments: readonly string[],
+  i: number,
+  depth: number,
+  leaf: (doc: SQL | AnyColumn, path: string, depth: number) => SQL,
+): SQL {
+  if (i === segments.length) return leaf(doc, path, depth);
+  const segment = segments[i] as string;
+  const key = `."${segment}"`;
+  const alias = sql.raw(`je${depth}`);
+  const descend = walkJson(doc, `${path}${key}`, segments, i + 1, depth, leaf);
+  const element = sql`${alias}.value`;
+  const fanOut = sql`exists (select 1 from json_each(${doc}, ${path}) as ${alias} where ${alias}.type = 'object' and ${walkJson(element, `$${key}`, segments, i + 1, depth + 1, leaf)})`;
+  const positional = /^\d+$/.test(segment)
+    ? sql`${walkJson(doc, `${path}[${segment}]`, segments, i + 1, depth, leaf)} or `
+    : sql``;
+  return sql`(case json_type(${doc}, ${path}) when 'array' then (${positional}${fanOut}) else ${descend} end)`;
+}
+
+/** Normalize a filter operand to the JSON1 value it is compared against. */
+function jsonOperand(
+  field: string,
+  value: unknown,
+): { kind: 'number' | 'text' | 'boolean' | 'json'; param: unknown } {
+  if (typeof value === 'number') return { kind: 'number', param: value };
+  if (typeof value === 'bigint') return { kind: 'number', param: value };
+  if (typeof value === 'string') return { kind: 'text', param: value };
+  if (typeof value === 'boolean') return { kind: 'boolean', param: value ? 1 : 0 };
+  if (value instanceof Date) return { kind: 'text', param: value.toISOString() };
+  if (typeof value === 'object' && value !== null) {
+    return { kind: 'json', param: JSON.stringify(value) };
+  }
+  throw new Error(
+    `sqlitekit/filter: cannot compare JSON field "${field}" against a ${typeof value} operand.`,
+  );
+}
+
+/** Type-guarded equality against one operand. */
+function equalsPredicate(field: string, operand: unknown): JsonPredicate {
+  const { kind, param } = jsonOperand(field, operand);
+  switch (kind) {
+    case 'number':
+      return (v, t) => sql`(${t} in ('integer', 'real') and ${v} = ${param})`;
+    case 'text':
+      return (v, t) => sql`(${t} = 'text' and ${v} = ${param})`;
+    case 'boolean':
+      return (_v, t) => (param === 1 ? sql`(${t} = 'true')` : sql`(${t} = 'false')`);
+    case 'json': {
+      const type = Array.isArray(operand) ? 'array' : 'object';
+      return (v, t) => sql`(${t} = ${type} and json(${v}) = json(${param}))`;
+    }
+  }
+}
+
+function anyEqualsPredicate(field: string, operands: readonly unknown[]): JsonPredicate {
+  const preds = operands.map((o) => equalsPredicate(field, o));
+  return (v, t) =>
+    sql`(${sql.join(
+      preds.map((p) => p(v, t)),
+      sql` or `,
+    )})`;
+}
+
+/** Type-guarded range comparison — never across a number/text boundary. */
+function comparePredicate(
+  field: string,
+  op: 'gt' | 'gte' | 'lt' | 'lte',
+  operand: unknown,
+): JsonPredicate {
+  const sqlOp = sql.raw(op === 'gt' ? '>' : op === 'gte' ? '>=' : op === 'lt' ? '<' : '<=');
+  const { kind, param } = jsonOperand(field, operand);
+  switch (kind) {
+    case 'number':
+    case 'boolean':
+      // Booleans order as 1/0 — repo-core's `matchFilter` does the same.
+      return (v, t) =>
+        sql`(${t} in ('integer', 'real', 'true', 'false') and ${v} ${sqlOp} ${param})`;
+    case 'text':
+      return (v, t) => sql`(${t} = 'text' and ${v} ${sqlOp} ${param})`;
+    case 'json':
+      throw new Error(
+        `sqlitekit/filter: range comparison on JSON field "${field}" needs a number, string or Date operand.`,
+      );
+  }
 }
 
 /**
