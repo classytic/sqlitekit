@@ -141,11 +141,13 @@ export function compileFilterToDrizzle(
       // it `like('notes', '50\\% off')` would match every row because
       // `%` would still wildcard.
       //
-      // SQLite LIKE is case-insensitive for ASCII by default and case-
-      // sensitive otherwise. For predictable behavior we `lower()` both
-      // sides when the caller asked for insensitive.
+      // SQLite LIKE is ASCII-case-INsensitive (unless the connection
+      // set `PRAGMA case_sensitive_like`), so it can only serve the
+      // insensitive variant. 'sensitive' compiles to GLOB, which is
+      // always case-sensitive and — for a literal prefix on a BINARY
+      // column — still uses an index. See `likeToGlob`.
       if (filter.caseSensitivity === 'sensitive') {
-        return sql`${col} LIKE ${filter.pattern} ESCAPE '\\'`;
+        return sql`${col} GLOB ${likeToGlob(filter.pattern)}`;
       }
       return sql`lower(${col}) LIKE lower(${filter.pattern}) ESCAPE '\\'`;
     }
@@ -362,9 +364,10 @@ function compileJsonLeaf(filter: LeafFilter, target: JsonTarget): SQL {
     case 'like': {
       const pattern = filter.pattern;
       const sensitive = filter.caseSensitivity === 'sensitive';
+      const glob = sensitive ? likeToGlob(pattern) : undefined;
       return jsonSome(target, (v, t) =>
-        sensitive
-          ? sql`(${t} = 'text' and ${v} like ${pattern} escape '\\')`
+        glob !== undefined
+          ? sql`(${t} = 'text' and ${v} glob ${glob})`
           : sql`(${t} = 'text' and lower(${v}) like lower(${pattern}) escape '\\')`,
       );
     }
@@ -498,6 +501,38 @@ function comparePredicate(
         `sqlitekit/filter: range comparison on JSON field "${field}" needs a number, string or Date operand.`,
       );
   }
+}
+
+/**
+ * Translate an IR `like` pattern to an equivalent SQLite GLOB pattern.
+ *
+ * IR patterns use `%` / `_` wildcards with backslash escaping exactly
+ * `\%`, `\_` and `\\` (repo-core's `escapeLikePattern`; any other
+ * backslash is a literal — same as the reference `matchFilter`). GLOB
+ * uses `*` / `?` and is case-sensitive regardless of
+ * `case_sensitive_like`. GLOB has no escape character: a literal
+ * metachar is written as a one-member bracket class — `[*]`, `[?]`,
+ * `[[]`. `]` outside a class is already literal.
+ */
+function likeToGlob(pattern: string): string {
+  let out = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i] as string;
+    const next = pattern[i + 1];
+    if (ch === '\\' && (next === '%' || next === '_' || next === '\\')) {
+      out += next;
+      i++;
+    } else if (ch === '%') {
+      out += '*';
+    } else if (ch === '_') {
+      out += '?';
+    } else if (ch === '*' || ch === '?' || ch === '[') {
+      out += `[${ch}]`;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
 }
 
 /**

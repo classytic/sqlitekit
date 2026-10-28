@@ -37,6 +37,10 @@ export default defineConfig({
     // deployments where SQLite is the primary store (edge / Pi /
     // single-node hosts).
     'lock/index': 'src/lock/index.ts',
+    // Usage counters — implements `UsageStore` from
+    // `@classytic/repo-core/usage` (atomic upsert-increment per
+    // (actor, period, kind) cell).
+    'usage/index': 'src/usage/index.ts',
     // Framework-agnostic adapter — produces `DataAdapter<TDoc>` from
     // `@classytic/repo-core/adapter`. Any host consuming that contract
     // (arc 3+, future arc-next, custom frameworks) wires this in.

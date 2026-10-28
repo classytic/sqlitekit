@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-10-29
+
+### Fixed — lock table bootstrap on Cloudflare D1
+
+- `createSqliteLockAdapter` created its table with a multi-line statement through `driver.exec`; D1's `exec` splits on newlines, so the first acquire failed there. The DDL is now one statement on one line.
+
+### Added — `@classytic/sqlitekit/usage`
+
+- `createSqliteUsageStore({ driver, tableName?, bootstrap? })` implements repo-core's `UsageStore` (mirrors mongokit's `createMongoUsageStore`): one row per `(actor, period, kind)`, incremented by a single `INSERT … ON CONFLICT DO UPDATE SET count = count + excluded.count RETURNING count`, so concurrent writers never lose counts. Extras: `incrementAndGet` (new total from the same statement), `pruneBefore(date | period)`, and `createUsageTableSql(tableName)` for migrations (`bootstrap: false`). Passes `runUsageStoreContract` on better-sqlite3, sqlite-wasm and expo-sqlite. Needs SQLite 3.35 or newer.
+
+### Fixed — `retryingTransaction` never retried `SQLITE_BUSY`
+
+- The kit declared `transactionRetry: 'caller'` but had no `isTransientConflictError`, so repo-core's `retryingTransaction` fell back to `neverTransient` and surfaced the first `SQLITE_BUSY`. `isTransientConflictError` now classifies `SQLITE_BUSY*` / `SQLITE_LOCKED*` (string codes, or numeric primary codes 5 / 6 incl. extended codes), walking Drizzle's `cause` chain. Pinned by a real two-connection lock conflict that retries and commits.
+
+### Fixed — case-sensitive `like` / `startsWith` / `endsWith` / `contains`
+
+- `'sensitive'` compiled to `LIKE … ESCAPE`, which SQLite matches ASCII-case-insensitively (unless `PRAGMA case_sensitive_like`), so `startsWith('key', 'run:', 'sensitive')` also matched `Run:a`. It now compiles to `GLOB` (literal `*` `?` `[` bracket-escaped), which is always case-sensitive and still uses an index for a literal prefix. Applies to scalar and JSON-column leaves.
+
+### Changed — peer floor to the latest published
+
+`@classytic/repo-core >=0.35.0` (its conformance suite now checks case-sensitive string operators, `findAll` sort and limit); `better-sqlite3 >=13.0.3` and `drizzle-orm >=0.45.4` as before.
+
 ## [0.11.0] - 2026-10-27
 
 ### Fixed — `findAll` ignored `sort`

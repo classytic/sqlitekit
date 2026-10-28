@@ -156,6 +156,7 @@ export default {
 | `@classytic/sqlitekit/plugins/audit` | `auditPlugin`, `AuditEntry` |
 | `@classytic/sqlitekit/plugins/cache` | `cachePlugin`, `createMemoryCacheAdapter` |
 | `@classytic/sqlitekit/plugins/ttl` | `ttlPlugin`, `createTtlPartialIndex`, `dropTtlPartialIndex` |
+| `@classytic/sqlitekit/usage` | `createSqliteUsageStore` (repo-core `UsageStore`: atomic per-cell counters, `incrementAndGet`, `pruneBefore`), `createUsageTableSql` |
 | `@classytic/sqlitekit/better-auth` | `createBetterAuthOverlay` — BA × Drizzle adapter for BA-managed sqlite tables (see below) |
 
 ## Better Auth bridge — `@classytic/sqlitekit/better-auth`

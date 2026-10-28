@@ -1,6 +1,6 @@
 {
   "name": "@classytic/sqlitekit",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "SQLite repository kit built on @classytic/repo-core — works with better-sqlite3 (Node) and expo-sqlite (React Native) via a pluggable driver interface.",
   "type": "module",
   "sideEffects": false,
@@ -142,6 +142,10 @@
       "types": "./dist/lock/index.d.mts",
       "default": "./dist/lock/index.mjs"
     },
+    "./usage": {
+      "types": "./dist/usage/index.d.mts",
+      "default": "./dist/usage/index.mjs"
+    },
     "./package.json": "./package.json"
   },
   "keywords": [
@@ -186,7 +190,7 @@
     "release": "npm run push -- main && npm run release:tag && npm publish"
   },
   "peerDependencies": {
-    "@classytic/repo-core": ">=0.34.0",
+    "@classytic/repo-core": ">=0.35.0",
     "better-sqlite3": ">=13.0.3",
     "drizzle-orm": ">=0.45.4"
   },
@@ -205,10 +209,10 @@
     "@better-auth/api-key": "^1.7.14",
     "@biomejs/biome": "^2.6.3",
     "@classytic/dev-tools": "^0.2.1",
-    "@classytic/repo-core": "^0.34.0",
+    "@classytic/repo-core": "^0.35.0",
     "@sqlite.org/sqlite-wasm": "^3.54.1-build1",
     "@types/better-sqlite3": "^9.6.0",
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "@vitest/coverage-v8": "^5.0.5",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
@@ -218,17 +222,12 @@
     "drizzle-orm": "^0.45.4",
     "fast-check": "^4.10.2",
     "knip": "^6.43.0",
-    "tsdown": "^0.23.2",
-    "typescript": "7.1.0-beta",
-    "vite": "^8.3.4",
+    "tsdown": "^0.23.3",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.5",
     "vitest": "^5.0.5"
   },
   "optionalDependencies": {
     "sqlite-vec": "^0.1.9"
-  },
-  "overrides": {
-    "tsdown": {
-      "typescript": "$typescript"
-    }
   }
 }

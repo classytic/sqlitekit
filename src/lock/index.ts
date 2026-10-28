@@ -124,13 +124,10 @@ export function createSqliteLockAdapter(options: SqliteLockAdapterOptions): Lock
     if (!bootstrap) return Promise.resolve();
     if (!bootstrapped) {
       bootstrapped = driver
+        // One statement on ONE line: D1's `exec` splits on newlines, so a
+        // multi-line CREATE TABLE would be sent as broken fragments.
         .exec(
-          `CREATE TABLE IF NOT EXISTS "${tableName}" (
-             name TEXT PRIMARY KEY,
-             holder TEXT NOT NULL,
-             expires_at INTEGER NOT NULL,
-             acquired_at INTEGER NOT NULL
-           );`,
+          `CREATE TABLE IF NOT EXISTS "${tableName}" (name TEXT PRIMARY KEY, holder TEXT NOT NULL, expires_at INTEGER NOT NULL, acquired_at INTEGER NOT NULL);`,
         )
         .catch((err) => {
           // Reset so a transient failure (DB locked, permission) is

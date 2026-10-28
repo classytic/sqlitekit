@@ -2277,6 +2277,41 @@ export class SqliteRepository<
   }
 
   /**
+   * Transient transaction conflict: another connection held the database
+   * (`SQLITE_BUSY`, incl. `SQLITE_BUSY_SNAPSHOT` / `_TIMEOUT`) or a table
+   * (`SQLITE_LOCKED`, incl. `SQLITE_LOCKED_SHAREDCACHE`), and re-running the
+   * work is the designed recovery. `retryingTransaction` consumes this
+   * (`transactionRetry: 'caller'`). Matches the driver's code — the string
+   * (better-sqlite3, libsql) or the numeric primary result code 5 / 6
+   * (bun:sqlite `errno`, sqlite-wasm) — walking `cause` because Drizzle
+   * wraps driver errors. Never message text.
+   */
+  isTransientConflictError(err: unknown): boolean {
+    let current: unknown = err;
+    for (let depth = 0; depth < 5 && current; depth++) {
+      if (typeof current !== 'object') break;
+      const e = current as {
+        code?: unknown;
+        errno?: unknown;
+        resultCode?: unknown;
+        cause?: unknown;
+      };
+      if (
+        typeof e.code === 'string' &&
+        (/^SQLITE_BUSY(_|$)/.test(e.code) || /^SQLITE_LOCKED(_|$)/.test(e.code))
+      ) {
+        return true;
+      }
+      for (const n of [e.errno, e.resultCode]) {
+        // Extended result codes keep the primary code in the low byte.
+        if (typeof n === 'number' && ((n & 0xff) === 5 || (n & 0xff) === 6)) return true;
+      }
+      current = e.cause;
+    }
+    return false;
+  }
+
+  /**
    * Run `fn` inside a Drizzle transaction. Callback receives a
    * tx-scoped repository — invoke methods on it, not on the outer
    * repo, so the BEGIN/COMMIT actually wraps your ops.
