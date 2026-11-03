@@ -156,10 +156,9 @@ export function createSqliteUsageStore(options: SqliteUsageStoreOptions): Sqlite
         sql: `SELECT kind, count FROM ${table} WHERE actor = ? AND period = ?`,
         params: [actor, period],
       });
-      const out: Record<string, number> = {};
       // sqlite-wasm surfaces 64-bit integers as bigint; the contract is `number`.
-      for (const row of rows) out[row.kind] = Number(row.count);
-      return out;
+      // fromEntries defines own properties: `out[kind] =` would hit the `__proto__` setter.
+      return Object.fromEntries(rows.map((row) => [row.kind, Number(row.count)]));
     },
 
     async pruneBefore(cutoff) {

@@ -7,9 +7,14 @@
  *
  * Transactions prefer `withExclusiveTransactionAsync`, which isolates the
  * callback from other queries on the same database. Where it is missing
- * (expo-sqlite on web), the driver falls back to BEGIN/COMMIT behind an
- * in-driver queue so concurrent calls cannot interleave with an open
- * transaction.
+ * (expo-sqlite on web), or when `transactions: 'connection'` is set, the
+ * driver runs BEGIN/COMMIT on the caller's own connection behind an in-driver
+ * queue so concurrent calls cannot interleave with an open transaction.
+ *
+ * `withExclusiveTransactionAsync` opens a SECOND native connection to the same
+ * file. Anything set up per connection (`ATTACH DATABASE`, temp tables,
+ * connection pragmas) is not there, so a host that attaches a second file
+ * must use `transactions: 'connection'`.
  */
 
 import type { PragmaSet } from './pragmas.js';
@@ -46,6 +51,13 @@ export interface ExpoSQLiteDatabaseLike {
 export interface ExpoSqliteDriverOptions {
   /** Pragmas applied once, in order, before the driver is used. See `productionPragmas()`. */
   pragmas?: PragmaSet;
+  /**
+   * How transactions run. `exclusive` (default) uses `withExclusiveTransactionAsync`
+   * when available: a separate connection that isolates the transaction. `connection`
+   * runs BEGIN IMMEDIATE / COMMIT on this connection behind the driver's queue, so
+   * attached databases and per-connection state stay visible inside the transaction.
+   */
+  transactions?: 'exclusive' | 'connection';
 }
 
 /** Wrap an opened expo-sqlite database (`await openDatabaseAsync(name)`) in the `SqliteDriver` contract. */
@@ -58,7 +70,7 @@ export async function createExpoSqliteDriver(
       await db.execAsync(`PRAGMA ${name} = ${value};`);
     }
   }
-  return makeDriver(db, createQueue());
+  return makeDriver(db, createQueue(), options.transactions === 'connection');
 }
 
 type Queue = <T>(task: () => Promise<T>) => Promise<T>;
@@ -73,7 +85,11 @@ function createQueue(): Queue {
   };
 }
 
-function makeDriver(db: ExpoSQLiteDatabaseLike, queue: Queue | undefined): SqliteDriver {
+function makeDriver(
+  db: ExpoSQLiteDatabaseLike,
+  queue: Queue | undefined,
+  sameConnection = false,
+): SqliteDriver {
   const guard = <T>(task: () => Promise<T>): Promise<T> => (queue ? queue(task) : task());
   const params = (stmt: SqliteStatement): Bind => stmt.params.map(toBind);
 
@@ -94,7 +110,7 @@ function makeDriver(db: ExpoSQLiteDatabaseLike, queue: Queue | undefined): Sqlit
       return guard(() => db.execAsync(sql));
     },
     async transaction<T>(callback: (tx: SqliteDriver) => Promise<T> | T): Promise<T> {
-      if (db.withExclusiveTransactionAsync) {
+      if (db.withExclusiveTransactionAsync && !sameConnection) {
         let result!: T;
         await db.withExclusiveTransactionAsync(async (txn) => {
           // The transaction handle is already isolated, so its driver needs no queue.
@@ -102,10 +118,11 @@ function makeDriver(db: ExpoSQLiteDatabaseLike, queue: Queue | undefined): Sqlit
         });
         return result;
       }
-      // Fallback: hold the queue for the whole transaction. The inner driver
+      // Same connection: hold the queue for the whole transaction. The inner driver
       // bypasses the queue (it already owns it), so nested calls cannot deadlock.
+      // IMMEDIATE takes the write lock up front instead of failing at the first write.
       return guard(async () => {
-        await db.execAsync('BEGIN');
+        await db.execAsync(sameConnection ? 'BEGIN IMMEDIATE' : 'BEGIN');
         try {
           const result = await callback(makeDriver(db, undefined));
           await db.execAsync('COMMIT');

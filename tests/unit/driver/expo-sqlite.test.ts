@@ -126,3 +126,30 @@ describe('createExpoSqliteDriver fallback ordering', () => {
     expect(raw.prepare('SELECT name FROM t').all()).toEqual([{ name: 'outside' }]);
   });
 });
+
+describe('createExpoSqliteDriver transactions: connection', () => {
+  it('runs the transaction on the caller connection, never the exclusive one', async () => {
+    const { expo, raw } = fakeExpo({ exclusive: true });
+    let exclusiveCalls = 0;
+    const exclusive = expo.withExclusiveTransactionAsync!;
+    expo.withExclusiveTransactionAsync = async (task) => {
+      exclusiveCalls++;
+      return exclusive(task);
+    };
+    // A database attached to this connection, as a host with two files does.
+    raw.exec("ATTACH DATABASE ':memory:' AS side; CREATE TABLE side.s (v TEXT)");
+    const driver = await createExpoSqliteDriver(expo, { transactions: 'connection' });
+    await driver.transaction(async (tx) => {
+      await tx.run({ sql: 'INSERT INTO side.s (v) VALUES (?)', params: ['kept'] });
+    });
+    expect(exclusiveCalls).toBe(0);
+    expect(raw.prepare('SELECT v FROM side.s').all()).toEqual([{ v: 'kept' }]);
+    await expect(
+      driver.transaction(async (tx) => {
+        await tx.run({ sql: 'INSERT INTO side.s (v) VALUES (?)', params: ['dropped'] });
+        throw new Error('boom');
+      }),
+    ).rejects.toThrow('boom');
+    expect(raw.prepare('SELECT COUNT(*) AS n FROM side.s').get()).toEqual({ n: 1 });
+  });
+});

@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 adhering to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-11-03
+
+### Fixed: `./usage` summary dropped a kind named `__proto__`
+
+`summary()` assigned `out[kind] = …`, which hits the `__proto__` setter, so that counter vanished. It now builds the result with `Object.fromEntries`. Found by repo-core 0.37's new usage-store scenario (kinds named like `Object.prototype` members).
+
+### Changed: peer floors to the latest published
+
+`@classytic/repo-core >=0.37.0` (the lock `acquire` contract and the new conformance scenarios), `better-sqlite3`, `drizzle-orm` raised to the latest. Dev toolchain refreshed.
+
+### Added: expo-sqlite `transactions: 'connection'`
+
+`createExpoSqliteDriver(db, { transactions: 'connection' })` runs transactions as BEGIN IMMEDIATE / COMMIT on the caller's own connection behind the driver queue. The default (`withExclusiveTransactionAsync`) opens a second native connection, which does not see per-connection state such as `ATTACH DATABASE`, so a host with an attached file failed every write inside a transaction. Default unchanged.
+
+### Fixed / Added — `leasePlugin` parity with mongokit
+
+The plugin now has the options and semantics mongokit's `leasePlugin` gained (see the mongokit CHANGELOG):
+
+- **Dead leases are status-scoped.** `lease()` used to recover any row with `leaseExpiresAt < now`, whatever its status, so a cancelled or terminal row that still carried a stale expiry was set back to `processing`. The dead-lease arm is now `status IN deadLeaseStatuses AND leaseExpiresAt < now`, default `[processingStatus]`; `deadLeaseStatuses: ['processing', 'retrying']` names more. An empty list throws at construction.
+- **`extend()` and `release()` require the row to still be in `processingStatus`.** A row the host moved out mid-lease (e.g. cancelled without clearing the lease columns) returns `null` instead of being kept alive or overwritten with `doneStatus`.
+- **Caller filter kept as given.** It was split into one `eq` per top-level key, so an operator record (`{ payload: { in: [...] } }`) or Filter IR (`or(...)`) broke the claim. It is now normalised like every other sqlitekit read (`recordToFilter`; IR passes through) and the claim condition is ANDed beside it.
+- **Clock.** The injected `nowFn` now also drives the new expiry: with an ISO-string clock the expiry used to be `Date.now() + leaseFor` (the wall clock), so a test or host clock moved the CAS but not the expiry. Per-call `now` on `lease`, `extend`, `release` and `reapExhausted` wins over `nowFn`; an invalid reading (not finite epoch ms, not a parseable date string) throws.
+- **Attempts.** `attemptsField` increments on every successful `lease()` (first claim and recovery; `NULL` counts as 0). `maxAttempts` (requires `attemptsField`) stops claiming rows whose counter is `>= maxAttempts`; a `NULL` counter is under the cap.
+- **`pendingFilter`** (plugin option or per call, per call replaces): ANDed into the pending arm only, so a dead lease is still recovered. Record or Filter IR, or a function `(now) => Filter` called per claim with the resolved `now`. Types `LeasePendingFilter`, `LeaseNow`.
+- **`reapExhausted({ filter?, now?, limit?, status?, pendingFilter? })`** with `exhaustedStatus` / `exhaustedAtField`: moves rows the cap keeps from being leased (pending, or a lapsed dead lease) to the terminal status, clears the lease columns, stamps `exhaustedAtField` with `now`, and returns the moved rows. Each move is a compare-and-set on the exhausted condition, so two reapers never both return a row. Same construction checks as mongokit (terminal status must differ from the pending, processing and dead-lease statuses).
+
+**Behaviour change / migration:** a row in a status other than `processingStatus` with a lapsed lease is no longer recovered; pass `deadLeaseStatuses` to name extra statuses. `extend` / `release` on a row no longer in `processingStatus` return `null`. A `nowFn` returning a string that `Date.parse` cannot read now throws (it was ignored for the expiry before). No package consumer in the workspace uses the lease plugin.
+
+**Differences from mongokit, by storage:**
+
+- The clock is in the lease column's representation (`() => string | number`, ISO-8601 text or epoch ms), not a `Date`; the expiry and `exhaustedAtField` are written in that same representation.
+- A caller filter record cannot carry `$or` / `$and` (sqlitekit records have no logical operators anywhere); a `$`-prefixed key is refused with a pointer to Filter IR (`or(eq(...), eq(...))`), which is kept as given.
+- Validation errors are plain `Error`s (mongokit throws HTTP 400 errors).
+
+Tests: `tests/integration/lease-plugin-parity.test.ts` (14 of its 16 cases fail against 0.12.0).
+
 ## [0.12.0] - 2026-10-29
 
 ### Fixed — lock table bootstrap on Cloudflare D1
